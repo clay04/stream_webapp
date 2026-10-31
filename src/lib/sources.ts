@@ -17,17 +17,20 @@ export function isDirectMediaUrl(url: string): boolean {
   return MEDIA_EXT.test(url);
 }
 
-export function isEmbedUrl(url: string): boolean {
-  return !isDirectMediaUrl(url);
+function slugToTitle(pathname: string, hostname: string): string {
+  const parts = pathname.split("/").filter(Boolean);
+  const last = parts[parts.length - 1] ?? "";
+  const cleaned = decodeURIComponent(last)
+    .replace(/\.[a-z0-9]{2,5}$/i, "")
+    .replace(/[_-]+/g, " ")
+    .trim();
+  return cleaned || hostname;
 }
 
 /**
  * Mengubah URL yang ditempel pengguna menjadi sumber yang didukung.
- * Didukung:
- * - YouTube (watch, youtu.be, shorts, embed, live, playlist)
- * - File video langsung (.mp4, .webm, .m3u8 HLS)
- * - XNXX (xnxx.com/video-xxx/..., xnxx.com/embedframe/xxx, beserta domain cerminnya)
- * - Vimeo & Twitch
+ * Mendukung YouTube, Vimeo, Twitch, file video langsung (.mp4/.webm/.m3u8),
+ * serta halaman web video eksternal.
  */
 export function parseVideoUrl(input: string): ParsedSource | null {
   const raw = input.trim();
@@ -73,33 +76,6 @@ export function parseVideoUrl(input: string): ParsedSource | null {
     return null;
   }
 
-  // XNXX (xnxx.com, xnxx.tv, xnxx.es, xnxx2.com, dll.)
-  if (/^xnxx[0-9]*\.(com|tv|es|dev|health|gold)$/i.test(host)) {
-    // Format: /video-<id>/<slug>
-    const videoMatch = url.pathname.match(/^\/video-([a-z0-9]+)(?:\/([^/?#]+))?/i);
-    if (videoMatch) {
-      const id = videoMatch[1];
-      const slug = videoMatch[2] ? decodeURIComponent(videoMatch[2]).replace(/[_-]+/g, " ").trim() : undefined;
-      return {
-        source: "url",
-        sourceId: `https://${url.hostname}/embedframe/${id}`,
-        url: url.toString(),
-        fallbackTitle: slug ? `XNXX · ${slug}` : `XNXX Video (${id})`,
-      };
-    }
-    // Format: /embedframe/<id>
-    const embedMatch = url.pathname.match(/^\/embedframe\/([a-z0-9]+)/i);
-    if (embedMatch) {
-      const id = embedMatch[1];
-      return {
-        source: "url",
-        sourceId: `https://${url.hostname}/embedframe/${id}`,
-        url: `https://${url.hostname}/video-${id}/`,
-        fallbackTitle: `XNXX Video (${id})`,
-      };
-    }
-  }
-
   // Vimeo
   if (host === "vimeo.com" || host === "player.vimeo.com") {
     const m = url.pathname.match(/\/(?:video\/)?([0-9]{6,12})/);
@@ -135,30 +111,55 @@ export function parseVideoUrl(input: string): ParsedSource | null {
     }
   }
 
-  // File media langsung (.mp4, .webm, .m3u8, dll.)
-  if (MEDIA_EXT.test(url.pathname + url.search)) {
-    return { source: "url", sourceId: url.toString(), url: url.toString() };
+  // Pola generik /video-<id>/<slug> atau /embedframe/<id>
+  const videoPathMatch = url.pathname.match(/^\/video-([a-z0-9]+)(?:\/([^/?#]+))?/i);
+  if (videoPathMatch) {
+    const id = videoPathMatch[1];
+    const slug = videoPathMatch[2] ? decodeURIComponent(videoPathMatch[2]).replace(/[_-]+/g, " ").trim() : undefined;
+    return {
+      source: "url",
+      sourceId: `${url.origin}/embedframe/${id}`,
+      url: url.toString(),
+      fallbackTitle: slug || `Video (${id})`,
+    };
+  }
+  const embedFrameMatch = url.pathname.match(/^\/embedframe\/([a-z0-9]+)/i);
+  if (embedFrameMatch) {
+    const id = embedFrameMatch[1];
+    return {
+      source: "url",
+      sourceId: `${url.origin}/embedframe/${id}`,
+      url: `${url.origin}/video-${id}/`,
+      fallbackTitle: `Video (${id})`,
+    };
   }
 
-  return null;
+  // File media langsung (.mp4, .webm, .m3u8, dll.) atau halaman web video lainnya
+  return {
+    source: "url",
+    sourceId: url.toString(),
+    url: url.toString(),
+    fallbackTitle: slugToTitle(url.pathname, host),
+  };
 }
 
 export function sourceUrl(source: QueueSource, sourceId: string): string {
+  const cleanId = sourceId.split("#embed=")[0];
   switch (source) {
     case "youtube":
-      return `https://www.youtube.com/watch?v=${sourceId}`;
+      return `https://www.youtube.com/watch?v=${cleanId}`;
     case "youtube_playlist":
-      return `https://www.youtube.com/playlist?list=${sourceId}`;
+      return `https://www.youtube.com/playlist?list=${cleanId}`;
     case "vimeo":
-      return `https://vimeo.com/${sourceId}`;
+      return `https://vimeo.com/${cleanId}`;
     case "twitch":
-      return sourceId.startsWith("video:")
-        ? `https://www.twitch.tv/videos/${sourceId.slice(6)}`
-        : `https://www.twitch.tv/${sourceId.replace(/^channel:/, "")}`;
+      return cleanId.startsWith("video:")
+        ? `https://www.twitch.tv/videos/${cleanId.slice(6)}`
+        : `https://www.twitch.tv/${cleanId.replace(/^channel:/, "")}`;
     default: {
-      const m = sourceId.match(/^(https?:\/\/[^/]+)\/embedframe\/([a-z0-9]+)/i);
+      const m = cleanId.match(/^(https?:\/\/[^/]+)\/embedframe\/([a-z0-9]+)/i);
       if (m) return `${m[1]}/video-${m[2]}/`;
-      return sourceId;
+      return cleanId;
     }
   }
 }

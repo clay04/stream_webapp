@@ -91,4 +91,5 @@ export interface PresenceMeta {
   onlineAt: number;
   inCall?: boolean;
   camOn?: boolean;
+  screenSharing?: boolean;
 }

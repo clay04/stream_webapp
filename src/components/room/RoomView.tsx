@@ -10,7 +10,7 @@ import { getClientId } from "@/lib/identity";
 import { loadQueue } from "@/lib/queue";
 import type { ChatMessage, QueueItem, Room, SyncState } from "@/lib/types";
 import AddVideoForm from "./AddVideoForm";
-import CallBar from "./CallBar";
+import CallBar, { CallAudioRenderer } from "./CallBar";
 import ChatPanel from "./ChatPanel";
 import ControlBar from "./ControlBar";
 import InfoPanel from "./InfoPanel";
@@ -35,6 +35,7 @@ export default function RoomView({ initial, userId, userName }: Props) {
   const [messages, setMessages] = useState<ChatMessage[]>(initial.messages);
   const [tab, setTab] = useState<Tab>("queue");
   const [focus, setFocus] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(false);
   const [unread, setUnread] = useState(0);
   const [reactions, setReactions] = useState<FloatingReaction[]>([]);
   const tabRef = useRef(tab);
@@ -43,6 +44,14 @@ export default function RoomView({ initial, userId, userName }: Props) {
 
   const self = useMemo(() => ({ clientId, userId, name: userName }), [clientId, userId, userName]);
   const { status, online, api } = useRoomChannel(room.id, self);
+
+  useEffect(() => {
+    const onFsChange = () => {
+      setIsFullscreen(!!document.fullscreenElement);
+    };
+    document.addEventListener("fullscreenchange", onFsChange);
+    return () => document.removeEventListener("fullscreenchange", onFsChange);
+  }, []);
 
   const refreshQueue = useCallback(async () => {
     try {
@@ -121,7 +130,6 @@ export default function RoomView({ initial, userId, userName }: Props) {
     [api, userName],
   );
 
-  // Event broadcast lain di room
   useEffect(() => {
     const offs = [
       api.on("queue", () => void refreshQueue()),
@@ -145,7 +153,6 @@ export default function RoomView({ initial, userId, userName }: Props) {
     return () => offs.forEach((off) => off());
   }, [api, addReaction, refreshQueue, router]);
 
-  // Nama dari presence (untuk anggota yang baru masuk)
   useEffect(() => {
     setNames((n) => {
       let changed = false;
@@ -165,9 +172,15 @@ export default function RoomView({ initial, userId, userName }: Props) {
   }, [tab]);
 
   const currentItem = queue.find((i) => i.id === sync.state.itemId) ?? null;
+  const showOverlayCall = focus || isFullscreen;
 
   const panel = (
     <div className="flex min-h-0 flex-1 flex-col">
+      {/* Panel Voice Call & Video Call di bagian atas Sidebar Kanan */}
+      {!showOverlayCall && (
+        <CallBar rtc={rtc} selfClientId={clientId} selfName={userName} online={online} mode="sidebar" />
+      )}
+
       <div role="tablist" aria-label="Panel room" className="flex shrink-0 border-b border-border">
         {(
           [
@@ -236,6 +249,9 @@ export default function RoomView({ initial, userId, userName }: Props) {
 
   return (
     <div className="flex h-dvh flex-col">
+      {/* Audio panggilan tetap hidup meskipun beralih antara mode normal dan Fullscreen/Fokus */}
+      <CallAudioRenderer peers={rtc.peers} />
+
       {!focus && (
         <header className="flex shrink-0 items-center gap-3 border-b border-border px-3 py-2 sm:px-4">
           <button onClick={() => router.push("/")} className="text-xl" aria-label="Kembali ke beranda">
@@ -263,10 +279,16 @@ export default function RoomView({ initial, userId, userName }: Props) {
             <PlayerStage
               item={currentItem}
               sync={sync}
+              screenShare={rtc.activeScreenShare}
+              onStopScreenShare={() => void rtc.toggleScreenShare()}
               reactions={reactions}
               peersBuffering={sync.peersBuffering}
               fill={focus}
             />
+            {/* Saat Fullscreen atau Mode Fokus, tampilan Voice/Video Call tetap melayang bersama video utama */}
+            {showOverlayCall && (
+              <CallBar rtc={rtc} selfClientId={clientId} selfName={userName} online={online} mode="overlay" />
+            )}
           </div>
           <ControlBar
             sync={sync}
@@ -283,7 +305,6 @@ export default function RoomView({ initial, userId, userName }: Props) {
             }}
             onReact={sendReaction}
           />
-          <CallBar rtc={rtc} selfClientId={clientId} selfName={userName} online={online} />
           {!focus && (
             <div className="border-b border-border px-3 py-3 sm:px-4 lg:border-b-0">
               <AddVideoForm

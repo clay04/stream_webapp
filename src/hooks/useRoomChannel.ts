@@ -44,6 +44,7 @@ export function useRoomChannel(
       onlineAt: metaRef.current?.onlineAt ?? Date.now(),
       inCall: metaRef.current?.inCall ?? false,
       camOn: metaRef.current?.camOn ?? false,
+      screenSharing: metaRef.current?.screenSharing ?? false,
     };
 
     const channel = supabase.channel(`room:${roomId}`, {

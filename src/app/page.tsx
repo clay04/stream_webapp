@@ -220,7 +220,7 @@ export default function HomePage() {
       )}
 
       <footer className="mt-auto text-center text-xs text-muted">
-        Video diputar langsung dari sumber resminya (YouTube atau file milik sendiri). Tidak mendukung situs bajakan.
+        Nonton bersama secara privat dan sinkron di dua perangkat.
       </footer>
     </main>
   );

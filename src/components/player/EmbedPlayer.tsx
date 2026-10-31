@@ -9,7 +9,7 @@ interface Props extends PlayerProps {
 }
 
 /**
- * Pemutar Embed (iframe) untuk XNXX (/embedframe/), Vimeo, Twitch, dan URL embed lainnya.
+ * Pemutar Embed (iframe), Vimeo, Twitch, dan URL embed lainnya.
  * Mengimplementasikan PlayerAdapter agar pergantian video di antrean dan kontrol dasar tetap berjalan.
  */
 export default function EmbedPlayer(props: Props) {
@@ -67,7 +67,6 @@ export default function EmbedPlayer(props: Props) {
       className="absolute inset-0 h-full w-full border-0 bg-black"
       allow="autoplay; fullscreen; picture-in-picture; encrypted-media"
       allowFullScreen
-      referrerPolicy="no-referrer"
       title="Pemutar video"
     />
   );

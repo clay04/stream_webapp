@@ -21,7 +21,7 @@ export default function AddVideoForm({ roomId, userId, queue, currentId, onAdded
   async function add(playNow: boolean) {
     setError(null);
     if (!parseVideoUrl(url)) {
-      setError("Tautan belum didukung. Gunakan tautan YouTube, XNXX, Vimeo, Twitch, atau file .mp4/.webm/.m3u8.");
+      setError("Tautan belum didukung. Gunakan tautan YouTube, Vimeo, Twitch, atau file .mp4/.webm/.m3u8.");
       return;
     }
     setBusy(true);
@@ -54,7 +54,7 @@ export default function AddVideoForm({ roomId, userId, queue, currentId, onAdded
           id="video-url"
           value={url}
           onChange={(e) => setUrl(e.target.value)}
-          placeholder="Tempel tautan YouTube, XNXX, Vimeo, Twitch, atau MP4…"
+          placeholder="Tempel tautan YouTube, Vimeo, Twitch, atau MP4…"
           inputMode="url"
           autoComplete="off"
           className="min-w-0 flex-1 rounded-xl border border-border bg-surface-2 px-3 py-2.5 text-sm outline-none focus:border-accent"

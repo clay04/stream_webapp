@@ -71,7 +71,7 @@ export default function ControlBar({ sync, rtc, hasItem, hasNext, focus, onToggl
         <span>{fmt(time.dur)}</span>
       </div>
 
-      <div className="flex items-center gap-1">
+      <div className="flex flex-wrap items-center gap-1">
         <button className={btn} disabled={!hasItem} onClick={() => sync.controls.seekBy(-10)} aria-label="Mundur 10 detik">
           ⏪
         </button>
@@ -93,31 +93,48 @@ export default function ControlBar({ sync, rtc, hasItem, hasNext, focus, onToggl
           🔄
         </button>
 
-        {/* Tombol mulai Voice / Video Call */}
-        {!rtc.inCall && (
-          <div className="ml-1 flex items-center gap-1">
-            <button
-              type="button"
-              disabled={rtc.connecting}
-              onClick={() => void rtc.joinCall(false)}
-              className="flex h-9 items-center gap-1.5 rounded-lg border border-border bg-surface-2 px-2.5 text-xs font-medium hover:border-accent disabled:opacity-50"
-              title="Mulai panggilan suara (Voice Call)"
-            >
-              <span>📞</span>
-              <span className="hidden sm:inline">Voice Call</span>
-            </button>
-            <button
-              type="button"
-              disabled={rtc.connecting}
-              onClick={() => void rtc.joinCall(true)}
-              className="flex h-9 items-center gap-1.5 rounded-lg border border-border bg-surface-2 px-2.5 text-xs font-medium hover:border-accent disabled:opacity-50"
-              title="Mulai panggilan video (Video Call)"
-            >
-              <span>📹</span>
-              <span className="hidden sm:inline">Video Call</span>
-            </button>
-          </div>
-        )}
+        {/* Tombol Share Layar (ditampilkan di panggung video utama) & Voice/Video Call */}
+        <div className="ml-1 flex items-center gap-1">
+          <button
+            type="button"
+            onClick={() => void rtc.toggleScreenShare()}
+            aria-pressed={rtc.screenSharing}
+            className={`flex h-9 items-center gap-1.5 rounded-lg border px-2.5 text-xs font-medium transition ${
+              rtc.screenSharing
+                ? "border-accent bg-accent/20 text-pink-200"
+                : "border-border bg-surface-2 hover:border-accent"
+            }`}
+            title="Bagikan layar / tab browser ke panggung video utama"
+          >
+            <span>🖥️</span>
+            <span className="hidden sm:inline">{rtc.screenSharing ? "Stop Share" : "Share Layar"}</span>
+          </button>
+
+          {!rtc.inCall && (
+            <>
+              <button
+                type="button"
+                disabled={rtc.connecting}
+                onClick={() => void rtc.joinCall(false)}
+                className="flex h-9 items-center gap-1.5 rounded-lg border border-border bg-surface-2 px-2.5 text-xs font-medium hover:border-accent disabled:opacity-50"
+                title="Mulai panggilan suara (Voice Call)"
+              >
+                <span>📞</span>
+                <span className="hidden sm:inline">Voice Call</span>
+              </button>
+              <button
+                type="button"
+                disabled={rtc.connecting}
+                onClick={() => void rtc.joinCall(true)}
+                className="flex h-9 items-center gap-1.5 rounded-lg border border-border bg-surface-2 px-2.5 text-xs font-medium hover:border-accent disabled:opacity-50"
+                title="Mulai panggilan video (Video Call)"
+              >
+                <span>📹</span>
+                <span className="hidden sm:inline">Video Call</span>
+              </button>
+            </>
+          )}
+        </div>
 
         <div className="relative ml-auto">
           <button
@@ -159,4 +176,3 @@ export default function ControlBar({ sync, rtc, hasItem, hasNext, focus, onToggl
     </div>
   );
 }
-
