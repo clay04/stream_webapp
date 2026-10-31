@@ -66,7 +66,7 @@ export default function RoomClient({ code }: { code: string }) {
         setPhase({ kind: "join" });
         return;
       }
-      setPhase({ kind: "ready", data, userId, name: data.profiles[userId] ?? stored });
+      setPhase({ kind: "ready", data, userId, name: stored || data.profiles[userId] });
     } catch (err) {
       setPhase({ kind: "error", message: (err as Error).message });
     }

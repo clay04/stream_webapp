@@ -21,8 +21,8 @@ export default function InfoPanel({ room, userId, online, names, onRoomUpdated, 
   const [error, setError] = useState<string | null>(null);
 
   const isOwner = room.owner_id === userId;
-  const onlineIds = new Set(online.map((p) => p.userId));
-  const memberIds = Array.from(new Set([...Object.keys(names), ...onlineIds]));
+  const onlineUserIds = new Set(online.map((p) => p.userId));
+  const offlineUserIds = Object.keys(names).filter((id) => !onlineUserIds.has(id));
 
   function copy(text: string, kind: "code" | "link") {
     void navigator.clipboard.writeText(text);
@@ -98,21 +98,24 @@ export default function InfoPanel({ room, userId, online, names, onRoomUpdated, 
       </section>
 
       <section className="space-y-2">
-        <h3 className="text-xs font-medium uppercase tracking-wider text-muted">Anggota ({memberIds.length})</h3>
+        <h3 className="text-xs font-medium uppercase tracking-wider text-muted">
+          Anggota ({online.length + offlineUserIds.length})
+        </h3>
         <ul className="space-y-1.5">
-          {memberIds.map((id) => {
-            const isOnline = onlineIds.has(id);
+          {online.map((p) => (
+            <li key={p.clientId} className="flex items-center gap-2.5 rounded-xl bg-surface px-3 py-2">
+              <Avatar name={p.name} online size={28} />
+              <span className="min-w-0 flex-1 truncate font-medium">{p.name}</span>
+              <span className="text-xs text-emerald-400">Online</span>
+            </li>
+          ))}
+          {offlineUserIds.map((id) => {
             const displayName = names[id] ?? "Tamu";
             return (
               <li key={id} className="flex items-center gap-2.5 rounded-xl bg-surface px-3 py-2">
-                <Avatar name={displayName} online={isOnline} size={28} />
-                <span className="min-w-0 flex-1 truncate font-medium">
-                  {displayName}
-                  {id === userId ? " (kamu)" : ""}
-                </span>
-                <span className={`text-xs ${isOnline ? "text-emerald-400" : "text-muted"}`}>
-                  {isOnline ? "Online" : "Offline"}
-                </span>
+                <Avatar name={displayName} online={false} size={28} />
+                <span className="min-w-0 flex-1 truncate font-medium">{displayName}</span>
+                <span className="text-xs text-muted">Offline</span>
               </li>
             );
           })}

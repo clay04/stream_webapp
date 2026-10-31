@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { PresenceMeta } from "@/lib/types";
 import type { RoomChannel } from "./useRoomChannel";
 
 const ICE_SERVERS: RTCIceServer[] = [
@@ -9,9 +10,10 @@ const ICE_SERVERS: RTCIceServer[] = [
 ];
 
 export interface RemotePeer {
-  userId: string;
+  clientId: string;
   name: string;
   stream: MediaStream;
+  streamVersion: number;
   micMuted: boolean;
   camOn: boolean;
 }
@@ -25,6 +27,8 @@ type RtcSignal =
       from: string;
       to: string;
       name: string;
+      micMuted?: boolean;
+      camOn?: boolean;
       description?: RTCSessionDescriptionInit;
       candidate?: RTCIceCandidateInit;
     };
@@ -33,29 +37,32 @@ interface PeerInternal {
   pc: RTCPeerConnection;
   name: string;
   stream: MediaStream;
+  streamVersion: number;
   micMuted: boolean;
   camOn: boolean;
+  hasConnectedOnce: boolean;
   makingOffer: boolean;
   ignoreOffer: boolean;
   isSettingRemoteAnswerPending: boolean;
   pendingCandidates: RTCIceCandidateInit[];
+  disconnectTimer?: number;
   analyser?: AnalyserNode;
   sourceNode?: MediaStreamAudioSourceNode;
 }
 
 interface Options {
-  selfId: string;
+  selfClientId: string;
   selfName: string;
   channel: RoomChannel;
-  onlineUserIds: string[];
+  online: PresenceMeta[];
   onVolumeDuck: (ducked: boolean) => void;
 }
 
 /**
  * WebRTC Voice & Video Call peer-to-peer di atas Supabase Realtime Broadcast
- * dengan pola W3C Perfect Negotiation + deteksi suara (VAD) untuk auto-ducking volume video.
+ * dengan negosiasi deterministik (bebas tabrakan offer) + deteksi suara (VAD) untuk auto-ducking volume video.
  */
-export function useWebRTC({ selfId, selfName, channel, onlineUserIds, onVolumeDuck }: Options) {
+export function useWebRTC({ selfClientId, selfName, channel, online, onVolumeDuck }: Options) {
   const [inCall, setInCall] = useState(false);
   const [connecting, setConnecting] = useState(false);
   const [micMuted, setMicMuted] = useState(false);
@@ -83,11 +90,12 @@ export function useWebRTC({ selfId, selfName, channel, onlineUserIds, onVolumeDu
 
   const syncPeersState = useCallback(() => {
     const list: RemotePeer[] = [];
-    for (const [userId, p] of peersRef.current.entries()) {
+    for (const [clientId, p] of peersRef.current.entries()) {
       list.push({
-        userId,
+        clientId,
         name: p.name,
         stream: p.stream,
+        streamVersion: p.streamVersion,
         micMuted: p.micMuted,
         camOn: p.camOn,
       });
@@ -129,6 +137,7 @@ export function useWebRTC({ selfId, selfName, channel, onlineUserIds, onVolumeDu
     (peerId: string) => {
       const p = peersRef.current.get(peerId);
       if (!p) return;
+      if (p.disconnectTimer) window.clearTimeout(p.disconnectTimer);
       try {
         p.sourceNode?.disconnect();
         p.pc.onicecandidate = null;
@@ -145,14 +154,54 @@ export function useWebRTC({ selfId, selfName, channel, onlineUserIds, onVolumeDu
     [syncPeersState],
   );
 
+  const sendOffer = useCallback(
+    async (peerId: string, peer: PeerInternal) => {
+      const { pc } = peer;
+      if (peer.makingOffer || pc.signalingState !== "stable") return;
+      try {
+        peer.makingOffer = true;
+        const offer = await pc.createOffer();
+        if (pc.signalingState !== "stable") return;
+        await pc.setLocalDescription(offer);
+        if (pc.localDescription) {
+          channel.send("rtc", {
+            type: "signal",
+            from: selfClientId,
+            to: peerId,
+            name: selfName,
+            micMuted: micMutedRef.current,
+            camOn: camOnRef.current,
+            description: pc.localDescription.toJSON(),
+          } satisfies RtcSignal);
+        }
+      } catch {
+        /* abaikan negosiasi gagal sementara */
+      } finally {
+        peer.makingOffer = false;
+      }
+    },
+    [channel, selfClientId, selfName],
+  );
+
   const getOrCreatePeer = useCallback(
-    (peerId: string, peerName: string): PeerInternal => {
+    (peerId: string, peerName: string, initialMedia?: { micMuted?: boolean; camOn?: boolean }): PeerInternal => {
       const existing = peersRef.current.get(peerId);
       if (existing) {
+        let changed = false;
         if (peerName && existing.name !== peerName) {
           existing.name = peerName;
-          syncPeersState();
+          changed = true;
         }
+        if (initialMedia?.micMuted !== undefined && existing.micMuted !== initialMedia.micMuted) {
+          existing.micMuted = initialMedia.micMuted;
+          changed = true;
+        }
+        if (initialMedia?.camOn !== undefined && existing.camOn !== initialMedia.camOn) {
+          existing.camOn = initialMedia.camOn;
+          existing.streamVersion++;
+          changed = true;
+        }
+        if (changed) syncPeersState();
         return existing;
       }
 
@@ -163,8 +212,10 @@ export function useWebRTC({ selfId, selfName, channel, onlineUserIds, onVolumeDu
         pc,
         name: peerName || "Pasangan",
         stream: remoteStream,
-        micMuted: false,
-        camOn: false,
+        streamVersion: 1,
+        micMuted: initialMedia?.micMuted ?? false,
+        camOn: initialMedia?.camOn ?? false,
+        hasConnectedOnce: false,
         makingOffer: false,
         ignoreOffer: false,
         isSettingRemoteAnswerPending: false,
@@ -175,7 +226,7 @@ export function useWebRTC({ selfId, selfName, channel, onlineUserIds, onVolumeDu
         if (candidate) {
           channel.send("rtc", {
             type: "signal",
-            from: selfId,
+            from: selfClientId,
             to: peerId,
             name: selfName,
             candidate: candidate.toJSON(),
@@ -183,24 +234,11 @@ export function useWebRTC({ selfId, selfName, channel, onlineUserIds, onVolumeDu
         }
       };
 
-      pc.onnegotiationneeded = async () => {
-        try {
-          peer.makingOffer = true;
-          await pc.setLocalDescription();
-          if (pc.localDescription) {
-            channel.send("rtc", {
-              type: "signal",
-              from: selfId,
-              to: peerId,
-              name: selfName,
-              description: pc.localDescription.toJSON(),
-            } satisfies RtcSignal);
-          }
-        } catch {
-          /* abaikan negosiasi gagal sementara */
-        } finally {
-          peer.makingOffer = false;
-        }
+      pc.onnegotiationneeded = () => {
+        // Saat koneksi awal, hanya satu pihak (selfClientId > peerId) yang membuat Offer
+        // agar tidak terjadi tabrakan offer (glare). Setelah terhubung, kedua pihak boleh renegosiasi.
+        if (!peer.hasConnectedOnce && selfClientId < peerId) return;
+        void sendOffer(peerId, peer);
       };
 
       pc.ontrack = ({ track, streams }) => {
@@ -215,24 +253,47 @@ export function useWebRTC({ selfId, selfName, channel, onlineUserIds, onVolumeDu
           peer.stream.addTrack(track);
         }
 
+        if (track.kind === "video") {
+          peer.camOn = true;
+        }
         if (track.kind === "audio" && !peer.analyser) {
           const { analyser, sourceNode } = attachStreamAnalyser(peer.stream);
           peer.analyser = analyser;
           peer.sourceNode = sourceNode;
         }
 
-        track.onunmute = () => syncPeersState();
-        track.onended = () => syncPeersState();
+        peer.streamVersion++;
+        track.onunmute = () => {
+          peer.streamVersion++;
+          syncPeersState();
+        };
+        track.onended = () => {
+          peer.streamVersion++;
+          syncPeersState();
+        };
         syncPeersState();
       };
 
       pc.onconnectionstatechange = () => {
-        if (pc.connectionState === "failed" || pc.connectionState === "closed") {
+        if (pc.connectionState === "connected") {
+          peer.hasConnectedOnce = true;
+          if (peer.disconnectTimer) {
+            window.clearTimeout(peer.disconnectTimer);
+            peer.disconnectTimer = undefined;
+          }
+        } else if (pc.connectionState === "disconnected") {
+          if (!peer.disconnectTimer) {
+            peer.disconnectTimer = window.setTimeout(() => {
+              if (pc.connectionState === "disconnected" || pc.connectionState === "failed") {
+                closePeer(peerId);
+              }
+            }, 7000);
+          }
+        } else if (pc.connectionState === "failed" || pc.connectionState === "closed") {
           closePeer(peerId);
         }
       };
 
-      // Tambahkan track lokal setelah seluruh event handler terdaftar agar onnegotiationneeded terpanggil
       const local = localStreamRef.current;
       if (local) {
         for (const track of local.getTracks()) {
@@ -244,7 +305,7 @@ export function useWebRTC({ selfId, selfName, channel, onlineUserIds, onVolumeDu
       syncPeersState();
       return peer;
     },
-    [attachStreamAnalyser, channel, closePeer, selfId, selfName, syncPeersState],
+    [attachStreamAnalyser, channel, closePeer, selfClientId, selfName, sendOffer, syncPeersState],
   );
 
   // ---------- Masuk ke panggilan ----------
@@ -284,7 +345,7 @@ export function useWebRTC({ selfId, selfName, channel, onlineUserIds, onVolumeDu
         channel.updatePresence({ inCall: true, camOn: hasVideo });
         channel.send("rtc", {
           type: "join",
-          from: selfId,
+          from: selfClientId,
           name: selfName,
           micMuted: false,
           camOn: hasVideo,
@@ -295,7 +356,7 @@ export function useWebRTC({ selfId, selfName, channel, onlineUserIds, onVolumeDu
         setConnecting(false);
       }
     },
-    [attachStreamAnalyser, channel, connecting, selfId, selfName],
+    [attachStreamAnalyser, channel, connecting, selfClientId, selfName],
   );
 
   // ---------- Keluar dari panggilan ----------
@@ -324,8 +385,8 @@ export function useWebRTC({ selfId, selfName, channel, onlineUserIds, onVolumeDu
     }
 
     channel.updatePresence({ inCall: false, camOn: false });
-    channel.send("rtc", { type: "leave", from: selfId } satisfies RtcSignal);
-  }, [channel, closePeer, selfId]);
+    channel.send("rtc", { type: "leave", from: selfClientId } satisfies RtcSignal);
+  }, [channel, closePeer, selfClientId]);
 
   // ---------- Mute / Unmute Mikrofon ----------
   const toggleMic = useCallback(() => {
@@ -339,12 +400,12 @@ export function useWebRTC({ selfId, selfName, channel, onlineUserIds, onVolumeDu
     setMicMuted(nextMuted);
     channel.send("rtc", {
       type: "media-state",
-      from: selfId,
+      from: selfClientId,
       name: selfName,
       micMuted: nextMuted,
       camOn: camOnRef.current,
     } satisfies RtcSignal);
-  }, [channel, selfId, selfName]);
+  }, [channel, selfClientId, selfName]);
 
   // ---------- Nyalakan / Matikan Kamera di tengah panggilan ----------
   const toggleCam = useCallback(async () => {
@@ -357,9 +418,10 @@ export function useWebRTC({ selfId, selfName, channel, onlineUserIds, onVolumeDu
       for (const track of stream.getVideoTracks()) {
         track.stop();
         stream.removeTrack(track);
-        for (const p of peersRef.current.values()) {
+        for (const [peerId, p] of peersRef.current.entries()) {
           const sender = p.pc.getSenders().find((s) => s.track === track);
           if (sender) p.pc.removeTrack(sender);
+          void sendOffer(peerId, p);
         }
       }
       camOnRef.current = false;
@@ -368,7 +430,7 @@ export function useWebRTC({ selfId, selfName, channel, onlineUserIds, onVolumeDu
       channel.updatePresence({ inCall: true, camOn: false });
       channel.send("rtc", {
         type: "media-state",
-        from: selfId,
+        from: selfClientId,
         name: selfName,
         micMuted: micMutedRef.current,
         camOn: false,
@@ -382,8 +444,9 @@ export function useWebRTC({ selfId, selfName, channel, onlineUserIds, onVolumeDu
         const videoTrack = camStream.getVideoTracks()[0];
         if (!videoTrack) return;
         stream.addTrack(videoTrack);
-        for (const p of peersRef.current.values()) {
+        for (const [peerId, p] of peersRef.current.entries()) {
           p.pc.addTrack(videoTrack, stream);
+          void sendOffer(peerId, p);
         }
         camOnRef.current = true;
         setCamOn(true);
@@ -391,7 +454,7 @@ export function useWebRTC({ selfId, selfName, channel, onlineUserIds, onVolumeDu
         channel.updatePresence({ inCall: true, camOn: true });
         channel.send("rtc", {
           type: "media-state",
-          from: selfId,
+          from: selfClientId,
           name: selfName,
           micMuted: micMutedRef.current,
           camOn: true,
@@ -400,28 +463,44 @@ export function useWebRTC({ selfId, selfName, channel, onlineUserIds, onVolumeDu
         setError((err as Error).message || "Tidak bisa menyalakan kamera.");
       }
     }
-  }, [channel, selfId, selfName]);
+  }, [channel, selfClientId, selfName, sendOffer]);
+
+  // ---------- Auto-discovery dari Presence (jika pasangan sudah di panggilan lebih dulu) ----------
+  useEffect(() => {
+    if (!inCall) return;
+    for (const p of online) {
+      if (p.clientId !== selfClientId && p.inCall && !peersRef.current.has(p.clientId)) {
+        getOrCreatePeer(p.clientId, p.name, { camOn: p.camOn });
+        channel.send("rtc", {
+          type: "join",
+          from: selfClientId,
+          name: selfName,
+          micMuted: micMutedRef.current,
+          camOn: camOnRef.current,
+        } satisfies RtcSignal);
+      }
+    }
+  }, [channel, getOrCreatePeer, inCall, online, selfClientId, selfName]);
 
   // ---------- Listener Signaling RTC ----------
   useEffect(() => {
     const off = channel.on("rtc", async (msg: RtcSignal) => {
-      if (!msg || msg.from === selfId || !inCallRef.current) return;
+      if (!msg || msg.from === selfClientId || !inCallRef.current) return;
 
       if (msg.type === "join") {
-        const peer = getOrCreatePeer(msg.from, msg.name);
-        peer.micMuted = msg.micMuted;
-        peer.camOn = msg.camOn;
-        syncPeersState();
-
+        const peer = getOrCreatePeer(msg.from, msg.name, { micMuted: msg.micMuted, camOn: msg.camOn });
         if (!msg.reply) {
           channel.send("rtc", {
             type: "join",
-            from: selfId,
+            from: selfClientId,
             name: selfName,
             micMuted: micMutedRef.current,
             camOn: camOnRef.current,
             reply: true,
           } satisfies RtcSignal);
+        }
+        if (selfClientId > msg.from) {
+          void sendOffer(msg.from, peer);
         }
         return;
       }
@@ -437,15 +516,16 @@ export function useWebRTC({ selfId, selfName, channel, onlineUserIds, onVolumeDu
           peer.name = msg.name || peer.name;
           peer.micMuted = msg.micMuted;
           peer.camOn = msg.camOn;
+          peer.streamVersion++;
           syncPeersState();
         }
         return;
       }
 
-      if (msg.type === "signal" && msg.to === selfId) {
-        const peer = getOrCreatePeer(msg.from, msg.name);
+      if (msg.type === "signal" && msg.to === selfClientId) {
+        const peer = getOrCreatePeer(msg.from, msg.name, { micMuted: msg.micMuted, camOn: msg.camOn });
         const { pc } = peer;
-        const polite = selfId < msg.from;
+        const polite = selfClientId < msg.from;
 
         try {
           if (msg.description) {
@@ -457,8 +537,16 @@ export function useWebRTC({ selfId, selfName, channel, onlineUserIds, onVolumeDu
             if (peer.ignoreOffer) return;
 
             peer.isSettingRemoteAnswerPending = msg.description.type === "answer";
-            await pc.setRemoteDescription(msg.description);
+            if (offerCollision) {
+              await Promise.all([
+                pc.setLocalDescription({ type: "rollback" }),
+                pc.setRemoteDescription(msg.description),
+              ]);
+            } else {
+              await pc.setRemoteDescription(msg.description);
+            }
             peer.isSettingRemoteAnswerPending = false;
+            peer.hasConnectedOnce = true;
 
             // Terapkan ICE candidate yang sempat antre sebelum remoteDescription siap
             while (peer.pendingCandidates.length > 0) {
@@ -471,13 +559,16 @@ export function useWebRTC({ selfId, selfName, channel, onlineUserIds, onVolumeDu
             }
 
             if (msg.description.type === "offer") {
-              await pc.setLocalDescription();
+              const answer = await pc.createAnswer();
+              await pc.setLocalDescription(answer);
               if (pc.localDescription) {
                 channel.send("rtc", {
                   type: "signal",
-                  from: selfId,
+                  from: selfClientId,
                   to: msg.from,
                   name: selfName,
+                  micMuted: micMutedRef.current,
+                  camOn: camOnRef.current,
                   description: pc.localDescription.toJSON(),
                 } satisfies RtcSignal);
               }
@@ -494,19 +585,19 @@ export function useWebRTC({ selfId, selfName, channel, onlineUserIds, onVolumeDu
             }
           }
         } catch {
-          /* abaikan kegagalan negosiasi transien */
+          peer.isSettingRemoteAnswerPending = false;
         }
       }
     });
 
     return () => off();
-  }, [channel, closePeer, getOrCreatePeer, selfId, selfName, syncPeersState]);
+  }, [channel, closePeer, getOrCreatePeer, selfClientId, selfName, sendOffer, syncPeersState]);
 
   // ---------- Deteksi Suara (VAD) & Auto-Ducking Volume Video ----------
   useEffect(() => {
     if (!inCall) return;
     const buf = new Uint8Array(64);
-    const SPEAK_THRESHOLD = 14; // deviasi amplitudo (0-128)
+    const SPEAK_THRESHOLD = 14;
     const HOLD_MS = 700;
 
     function rmsLevel(analyser: AnalyserNode): number {
@@ -524,7 +615,7 @@ export function useWebRTC({ selfId, selfName, channel, onlineUserIds, onVolumeDu
       let anyRemoteSpeaking = false;
 
       if (localAnalyserRef.current && !micMutedRef.current) {
-        nextSpeaking[selfId] = rmsLevel(localAnalyserRef.current) > SPEAK_THRESHOLD;
+        nextSpeaking[selfClientId] = rmsLevel(localAnalyserRef.current) > SPEAK_THRESHOLD;
       }
 
       for (const [peerId, p] of peersRef.current.entries()) {
@@ -549,9 +640,8 @@ export function useWebRTC({ selfId, selfName, channel, onlineUserIds, onVolumeDu
     }, 150);
 
     return () => window.clearInterval(id);
-  }, [inCall, selfId]);
+  }, [inCall, selfClientId]);
 
-  // Matikan ducking jika pengguna mematikan toggle autoDuck
   useEffect(() => {
     if (!autoDuck && isDuckedRef.current) {
       isDuckedRef.current = false;
@@ -559,22 +649,11 @@ export function useWebRTC({ selfId, selfName, channel, onlineUserIds, onVolumeDu
     }
   }, [autoDuck]);
 
-  // Bersihkan peer yang keluar dari room (presence offline)
-  useEffect(() => {
-    if (!inCallRef.current) return;
-    const onlineSet = new Set(onlineUserIds);
-    for (const peerId of Array.from(peersRef.current.keys())) {
-      if (!onlineSet.has(peerId)) {
-        closePeer(peerId);
-      }
-    }
-  }, [closePeer, onlineUserIds]);
-
-  // Bersihkan saat keluar halaman
   useEffect(() => {
     return () => {
       if (inCallRef.current) {
         for (const p of peersRef.current.values()) {
+          if (p.disconnectTimer) window.clearTimeout(p.disconnectTimer);
           try {
             p.pc.close();
           } catch {

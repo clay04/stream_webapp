@@ -7,11 +7,13 @@ import { Avatar } from "./PresenceBar";
 
 function MediaElement({
   stream,
+  streamVersion,
   muted,
   video,
   mirror,
 }: {
   stream: MediaStream | null;
+  streamVersion: number;
   muted: boolean;
   video: boolean;
   mirror?: boolean;
@@ -24,14 +26,14 @@ function MediaElement({
       videoRef.current.srcObject = stream;
       void videoRef.current.play().catch(() => {});
     }
-  }, [stream, video, stream?.getVideoTracks().length]);
+  }, [stream, streamVersion, video]);
 
   useEffect(() => {
     if (!muted && audioRef.current && stream) {
       audioRef.current.srcObject = stream;
       void audioRef.current.play().catch(() => {});
     }
-  }, [stream, muted, stream?.getAudioTracks().length]);
+  }, [stream, streamVersion, muted]);
 
   return (
     <>
@@ -51,16 +53,15 @@ function MediaElement({
 
 interface Props {
   rtc: WebRTCController;
-  selfId: string;
+  selfClientId: string;
   selfName: string;
   online: PresenceMeta[];
 }
 
-export default function CallBar({ rtc, selfId, selfName, online }: Props) {
+export default function CallBar({ rtc, selfClientId, selfName, online }: Props) {
   const [largeVideo, setLargeVideo] = useState(false);
-  const partnersInCall = online.filter((p) => p.userId !== selfId && p.inCall);
+  const partnersInCall = online.filter((p) => p.clientId !== selfClientId && p.inCall);
 
-  // Jika belum masuk panggilan dan pasangan juga belum di panggilan, tampilkan hanya error jika ada
   if (!rtc.inCall && partnersInCall.length === 0 && !rtc.error) {
     return null;
   }
@@ -116,23 +117,25 @@ export default function CallBar({ rtc, selfId, selfName, online }: Props) {
               <ParticipantTile
                 name={`${selfName} (Kamu)`}
                 stream={rtc.localStream}
+                streamVersion={rtc.camOn ? 1 : 0}
                 isSelf
                 micMuted={rtc.micMuted}
                 camOn={rtc.camOn}
-                speaking={!!rtc.speaking[selfId]}
+                speaking={!!rtc.speaking[selfClientId]}
                 large={largeVideo}
                 onToggleSize={() => setLargeVideo((v) => !v)}
               />
 
               {rtc.peers.map((peer: RemotePeer) => (
                 <ParticipantTile
-                  key={peer.userId}
+                  key={peer.clientId}
                   name={peer.name}
                   stream={peer.stream}
+                  streamVersion={peer.streamVersion}
                   isSelf={false}
                   micMuted={peer.micMuted}
                   camOn={peer.camOn}
-                  speaking={!!rtc.speaking[peer.userId]}
+                  speaking={!!rtc.speaking[peer.clientId]}
                   large={largeVideo}
                   onToggleSize={() => setLargeVideo((v) => !v)}
                 />
@@ -210,6 +213,7 @@ export default function CallBar({ rtc, selfId, selfName, online }: Props) {
 function ParticipantTile({
   name,
   stream,
+  streamVersion,
   isSelf,
   micMuted,
   camOn,
@@ -219,6 +223,7 @@ function ParticipantTile({
 }: {
   name: string;
   stream: MediaStream | null;
+  streamVersion: number;
   isSelf: boolean;
   micMuted: boolean;
   camOn: boolean;
@@ -237,7 +242,7 @@ function ParticipantTile({
           large ? "h-36 w-56 sm:h-44 sm:w-72" : "h-20 w-32 sm:h-24 sm:w-40"
         }`}
       >
-        <MediaElement stream={stream} muted={isSelf} video mirror={isSelf} />
+        <MediaElement stream={stream} streamVersion={streamVersion} muted={isSelf} video mirror={isSelf} />
         <div className="pointer-events-none absolute inset-x-0 bottom-0 flex items-center justify-between bg-gradient-to-t from-black/80 via-black/40 to-transparent px-2 py-1 text-[11px] text-white">
           <span className="truncate font-medium">{name}</span>
           <span>{micMuted ? "🔇" : speaking ? "🗣️" : ""}</span>
@@ -248,11 +253,10 @@ function ParticipantTile({
 
   return (
     <div className={`flex items-center gap-2 rounded-full bg-surface-2 px-3 py-1.5 text-xs ${ringCls}`}>
-      <MediaElement stream={stream} muted={isSelf} video={false} />
+      <MediaElement stream={stream} streamVersion={streamVersion} muted={isSelf} video={false} />
       <Avatar name={name} size={22} />
       <span className="max-w-28 truncate font-medium">{name}</span>
       <span>{micMuted ? "🔇" : speaking ? "🟢" : "🎙️"}</span>
     </div>
   );
 }
-

@@ -10,18 +10,18 @@ import type { RoomChannel } from "./useRoomChannel";
 /** Ambang koreksi (detik). */
 const EVENT_THRESHOLD = 0.75; // saat menerima play/pause/seek eksplisit
 const DRIFT_THRESHOLD = 1.5; // koreksi drift dari heartbeat / pemantauan lokal
-const SEEK_JUMP = 1.2; // lompatan waktu lokal yang dianggap seek oleh pengguna
-const HEARTBEAT_MS = 5000;
+const SEEK_JUMP = 1.4; // lompatan waktu lokal yang dianggap seek oleh pengguna
+const HEARTBEAT_MS = 4000;
 const POLL_MS = 500;
 
 export function expectedPosition(s: SyncState, now = serverNow()) {
   if (s.status !== "playing") return s.position;
-  return s.position + ((now - s.updatedAt) / 1000) * s.rate;
+  return Math.max(0, s.position + ((now - s.updatedAt) / 1000) * s.rate);
 }
 
 export function nextQueueItem(queue: QueueItem[], currentId: string | null): QueueItem | null {
   const sorted = [...queue].sort((a, b) => a.position - b.position);
-  if (!currentId) return sorted.find((i) => !i.played_at) ?? null;
+  if (!currentId) return sorted.find((i) => !i.played_at) ?? sorted[0] ?? null;
   const idx = sorted.findIndex((i) => i.id === currentId);
   if (idx === -1) return sorted.find((i) => !i.played_at) ?? null;
   return sorted[idx + 1] ?? null;
@@ -29,13 +29,14 @@ export function nextQueueItem(queue: QueueItem[], currentId: string | null): Que
 
 interface Options {
   roomId: string;
-  selfId: string;
+  selfClientId: string;
+  selfUserId: string;
+  selfName: string;
   channel: RoomChannel;
   initial: SyncState;
   queue: QueueItem[];
-  /** Pengguna sudah menekan "Gabung dan mulai" (syarat autoplay browser). */
-  started: boolean;
   onUnknownItem: () => void;
+  onItemReceived: (item: QueueItem) => void;
 }
 
 /**
@@ -43,18 +44,30 @@ interface Options {
  * ganti video/kecepatan) menjadi state bersama baru yang disiarkan; penerima menghitung
  * posisi target = position + (now - sentAt) lalu mengoreksi pemutar bila melewati ambang.
  */
-export function usePlaybackSync({ roomId, selfId, channel, initial, queue, started, onUnknownItem }: Options) {
+export function usePlaybackSync({
+  roomId,
+  selfClientId,
+  selfUserId,
+  selfName,
+  channel,
+  initial,
+  queue,
+  onUnknownItem,
+  onItemReceived,
+}: Options) {
   const [state, setState] = useState<SyncState>(initial);
   const [playerState, setPlayerState] = useState<PlayerState>("unstarted");
+  const [autoplayBlocked, setAutoplayBlocked] = useState(false);
+  const [peersBuffering, setPeersBuffering] = useState<string[]>([]);
 
   const desired = useRef<SyncState>(initial);
   const adapter = useRef<PlayerAdapter | null>(null);
   const queueRef = useRef(queue);
   queueRef.current = queue;
-  const startedRef = useRef(started);
-  startedRef.current = started;
   const onUnknownRef = useRef(onUnknownItem);
   onUnknownRef.current = onUnknownItem;
+  const onItemReceivedRef = useRef(onItemReceived);
+  onItemReceivedRef.current = onItemReceived;
 
   /** Event pemutar sebelum waktu ini dianggap akibat sinkronisasi (flag `remote`), bukan aksi pengguna. */
   const suppressUntil = useRef(0);
@@ -63,6 +76,7 @@ export function usePlaybackSync({ roomId, selfId, channel, initial, queue, start
   const pauseTimer = useRef<number | null>(null);
   const persistTimer = useRef<number | null>(null);
   const bufferingRef = useRef(false);
+  const peersBufferingMap = useRef(new Map<string, string>());
 
   const suppress = (ms = 1200) => {
     suppressUntil.current = Math.max(suppressUntil.current, performance.now() + ms);
@@ -87,16 +101,16 @@ export function usePlaybackSync({ roomId, selfId, channel, initial, queue, start
           position: expectedPosition(s),
           rate: s.rate,
           playlist_index: s.playlistIndex,
-          updated_by: selfId,
+          updated_by: selfUserId,
         })
         .eq("room_id", roomId);
     }, 300);
-  }, [roomId, selfId]);
+  }, [roomId, selfUserId]);
 
   // ---------- Terapkan state bersama ke pemutar lokal ----------
-  const reconcile = useCallback((threshold: number) => {
+  const reconcile = useCallback((threshold: number, skipSeekIfStarting = false) => {
     const a = adapter.current;
-    if (!a || !startedRef.current) return;
+    if (!a) return;
     const s = desired.current;
     const st = a.getState();
 
@@ -109,9 +123,12 @@ export function usePlaybackSync({ roomId, selfId, channel, initial, queue, start
     }
 
     const target = expectedPosition(s);
-    if (Math.abs(a.getCurrentTime() - target) > threshold) {
-      suppress();
-      a.seekTo(target);
+    const curPos = a.getCurrentTime();
+    if (!skipSeekIfStarting || Math.abs(curPos - target) > 3) {
+      if (Math.abs(curPos - target) > threshold) {
+        suppress();
+        a.seekTo(target);
+      }
     }
     if (Math.abs(a.getRate() - s.rate) > 0.01) {
       suppress();
@@ -130,30 +147,31 @@ export function usePlaybackSync({ roomId, selfId, channel, initial, queue, start
 
   // ---------- Aksi lokal → state bersama baru ----------
   const commit = useCallback(
-    (type: SyncEventType, patch: Partial<SyncState>) => {
+    (type: SyncEventType, patch: Partial<SyncState>, explicitItem?: QueueItem | null) => {
       const now = serverNow();
-      const s: SyncState = { ...desired.current, ...patch, updatedAt: now, by: selfId };
+      const s: SyncState = { ...desired.current, ...patch, updatedAt: now, by: selfClientId };
       setDesired(s);
-      const item = queueRef.current.find((i) => i.id === s.itemId);
+      const item = explicitItem ?? queueRef.current.find((i) => i.id === s.itemId) ?? null;
       const evt: SyncEvent = {
         type,
         state: s,
+        item,
         videoId: item?.source_id ?? null,
         source: item?.source ?? null,
         sentAt: now,
-        senderId: selfId,
+        senderId: selfClientId,
       };
       channel.send("sync", evt);
       persist();
     },
-    [channel, persist, selfId, setDesired],
+    [channel, persist, selfClientId, setDesired],
   );
 
   const currentPos = () => adapter.current?.getCurrentTime() ?? expectedPosition(desired.current);
 
   // ---------- Kontrol bersama (tombol di UI aplikasi) ----------
   const changeVideo = useCallback(
-    (itemId: string | null) => {
+    (itemId: string | null, explicitItem?: QueueItem | null) => {
       const prev = desired.current.itemId;
       if (prev && prev !== itemId) {
         void getSupabaseBrowser()
@@ -162,14 +180,29 @@ export function usePlaybackSync({ roomId, selfId, channel, initial, queue, start
           .eq("id", prev);
       }
       adapter.current = null;
-      commit("change_video", { itemId, status: itemId ? "playing" : "paused", position: 0, playlistIndex: 0, rate: 1 });
+      setAutoplayBlocked(false);
+      commit(
+        "change_video",
+        { itemId, status: itemId ? "playing" : "paused", position: 0, playlistIndex: 0, rate: 1 },
+        explicitItem,
+      );
     },
     [commit],
   );
 
   const play = useCallback(() => {
+    setAutoplayBlocked(false);
     commit("play", { status: "playing", position: currentPos() });
     reconcile(EVENT_THRESHOLD);
+  }, [commit, reconcile]);
+
+  /** Dipanggil saat pengguna menekan tombol pembuka blokir autoplay browser. */
+  const unlockAndPlay = useCallback(() => {
+    setAutoplayBlocked(false);
+    if (desired.current.status !== "playing") {
+      commit("play", { status: "playing", position: currentPos() });
+    }
+    reconcile(0.4);
   }, [commit, reconcile]);
 
   const pause = useCallback(() => {
@@ -190,12 +223,12 @@ export function usePlaybackSync({ roomId, selfId, channel, initial, queue, start
 
   const next = useCallback(() => {
     const n = nextQueueItem(queueRef.current, desired.current.itemId);
-    changeVideo(n?.id ?? null);
+    changeVideo(n?.id ?? null, n);
   }, [changeVideo]);
 
   const requestState = useCallback(() => {
-    channel.send("state_request", { senderId: selfId });
-  }, [channel, selfId]);
+    channel.send("state_request", { senderId: selfClientId });
+  }, [channel, selfClientId]);
 
   // ---------- Callback dari pemutar ----------
   const onPlayerReady = useCallback(
@@ -203,14 +236,14 @@ export function usePlaybackSync({ roomId, selfId, channel, initial, queue, start
       adapter.current = a;
       lastSample.current = null;
       suppress(1500);
-      reconcile(EVENT_THRESHOLD);
+      reconcile(EVENT_THRESHOLD, true);
     },
     [reconcile],
   );
 
   const handleEnded = useCallback(() => {
     const n = nextQueueItem(queueRef.current, desired.current.itemId);
-    if (n) changeVideo(n.id);
+    if (n) changeVideo(n.id, n);
     else if (desired.current.status === "playing") {
       commit("pause", { status: "paused", position: adapter.current?.getDuration() ?? desired.current.position });
     }
@@ -219,11 +252,14 @@ export function usePlaybackSync({ roomId, selfId, channel, initial, queue, start
   const onPlayerState = useCallback(
     (st: PlayerState) => {
       setPlayerState(st);
+      if (st === "playing") setAutoplayBlocked(false);
+
       const buffering = st === "buffering";
       if (buffering !== bufferingRef.current) {
         bufferingRef.current = buffering;
-        channel.updatePresence({ buffering });
+        channel.send("buffering", { clientId: selfClientId, name: selfName, buffering });
       }
+
       if (st === "ended") {
         handleEnded();
         return;
@@ -242,10 +278,10 @@ export function usePlaybackSync({ roomId, selfId, channel, initial, queue, start
           if (a.getState() === "paused" && desired.current.status === "playing") {
             commit("pause", { status: "paused", position: a.getCurrentTime() });
           }
-        }, 350);
+        }, 400);
       }
     },
-    [channel, commit, handleEnded],
+    [channel, commit, handleEnded, selfClientId, selfName],
   );
 
   const onPlayerRate = useCallback(
@@ -259,32 +295,47 @@ export function usePlaybackSync({ roomId, selfId, channel, initial, queue, start
   // ---------- Event dari peserta lain ----------
   useEffect(() => {
     const offSync = channel.on("sync", (evt: SyncEvent) => {
-      if (!evt?.state || evt.senderId === selfId) return;
+      if (!evt?.state || evt.senderId === selfClientId) return;
+      if (evt.item) {
+        onItemReceivedRef.current(evt.item);
+      }
       const s = evt.state;
       const cur = desired.current;
-      // Last-writer-wins berdasarkan waktu server terkoreksi.
-      if (s.updatedAt < cur.updatedAt && evt.type !== "heartbeat") return;
-      if (evt.type === "heartbeat" && s.itemId !== cur.itemId && s.updatedAt < cur.updatedAt) return;
+      if (s.updatedAt < cur.updatedAt && evt.type !== "heartbeat" && evt.type !== "state") return;
 
       const itemChanged = s.itemId !== cur.itemId;
-      if (itemChanged) adapter.current = null;
+      if (itemChanged) {
+        adapter.current = null;
+        setAutoplayBlocked(false);
+      }
       setDesired(s);
-      if (s.itemId && !queueRef.current.some((i) => i.id === s.itemId)) onUnknownRef.current();
+      if (s.itemId && !evt.item && !queueRef.current.some((i) => i.id === s.itemId)) {
+        onUnknownRef.current();
+      }
       if (!itemChanged) {
         reconcile(evt.type === "heartbeat" ? DRIFT_THRESHOLD : evt.type === "seek" ? 0.3 : EVENT_THRESHOLD);
       }
     });
 
     const offReq = channel.on("state_request", (p: { senderId: string }) => {
-      if (p?.senderId === selfId) return;
+      if (p?.senderId === selfClientId) return;
       const d = desired.current;
+      if (!d.itemId) return;
       const a = adapter.current;
       const fresh: SyncState =
         a && d.status === "playing" && a.getState() === "playing"
           ? { ...d, position: a.getCurrentTime(), updatedAt: serverNow() }
           : d;
-      const evt: SyncEvent = { type: "state", state: fresh, sentAt: serverNow(), senderId: selfId };
+      const item = queueRef.current.find((i) => i.id === fresh.itemId) ?? null;
+      const evt: SyncEvent = { type: "state", state: fresh, item, sentAt: serverNow(), senderId: selfClientId };
       channel.send("sync", evt);
+    });
+
+    const offBuf = channel.on("buffering", (p: { clientId: string; name: string; buffering: boolean }) => {
+      if (!p || p.clientId === selfClientId) return;
+      if (p.buffering) peersBufferingMap.current.set(p.clientId, p.name);
+      else peersBufferingMap.current.delete(p.clientId);
+      setPeersBuffering(Array.from(peersBufferingMap.current.values()));
     });
 
     // Join di tengah jalan: minta state terkini dari peserta yang online.
@@ -293,28 +344,29 @@ export function usePlaybackSync({ roomId, selfId, channel, initial, queue, start
     return () => {
       offSync();
       offReq();
+      offBuf();
       offSub();
     };
-  }, [channel, reconcile, requestState, selfId, setDesired]);
+  }, [channel, reconcile, requestState, selfClientId, setDesired]);
 
-  // Pengguna baru menekan "Gabung dan mulai": terapkan state yang sedang berjalan.
-  useEffect(() => {
-    if (started) reconcile(EVENT_THRESHOLD);
-  }, [started, reconcile]);
-
-  // ---------- Pemantauan lokal: deteksi seek pengguna & koreksi drift ----------
+  // ---------- Pemantauan lokal: deteksi seek pengguna, koreksi drift & deteksi blokir autoplay ----------
   useEffect(() => {
     const id = window.setInterval(() => {
       const a = adapter.current;
-      if (!a || !startedRef.current) return;
+      if (!a) return;
       const now = performance.now();
       const pos = a.getCurrentTime();
       const st = a.getState();
       const idx = a.getPlaylistIndex();
       const prev = lastSample.current;
       lastSample.current = { t: now, pos, st, idx };
-      if (!prev || isSuppressed()) return;
       const d = desired.current;
+
+      if (st === "playing") {
+        setAutoplayBlocked(false);
+      }
+
+      if (!prev || isSuppressed()) return;
 
       // Pindah video di dalam playlist lewat kontrol YouTube.
       const item = queueRef.current.find((i) => i.id === d.itemId);
@@ -328,7 +380,7 @@ export function usePlaybackSync({ roomId, selfId, channel, initial, queue, start
       const maxAdvance = prev.st === "playing" || st === "playing" ? elapsed * a.getRate() : 0;
       const delta = pos - prev.pos;
       const jump = delta < 0 ? -delta : Math.max(0, delta - maxAdvance);
-      if (jump > SEEK_JUMP && st !== "ended") {
+      if (jump > SEEK_JUMP && st !== "ended" && st !== "unstarted") {
         commit("seek", { position: pos });
         return;
       }
@@ -339,30 +391,37 @@ export function usePlaybackSync({ roomId, selfId, channel, initial, queue, start
         return;
       }
 
-      // Status tidak cocok cukup lama (mis. play terblokir) → coba terapkan lagi.
+      // Status tidak cocok cukup lama (mis. autoplay dengan suara diblokir browser) → coba terapkan & tampilkan tombol
       const mismatch =
         (d.status === "playing" && (st === "paused" || st === "unstarted")) ||
         (d.status === "paused" && st === "playing");
       mismatchCount.current = mismatch ? mismatchCount.current + 1 : 0;
-      if (mismatchCount.current >= 4) reconcile(EVENT_THRESHOLD);
+      if (mismatchCount.current === 3) {
+        reconcile(EVENT_THRESHOLD);
+      } else if (mismatchCount.current >= 5 && d.status === "playing" && (st === "paused" || st === "unstarted")) {
+        setAutoplayBlocked(true);
+      }
     }, POLL_MS);
     return () => window.clearInterval(id);
   }, [commit, reconcile]);
 
-  // ---------- Heartbeat dari pengirim aktif ----------
+  // ---------- Heartbeat berkala saat memutar ----------
   useEffect(() => {
     const id = window.setInterval(() => {
       const a = adapter.current;
       const d = desired.current;
-      if (!a || d.status !== "playing" || d.by !== selfId || a.getState() !== "playing" || isSuppressed()) return;
-      const s: SyncState = { ...d, position: a.getCurrentTime(), updatedAt: serverNow() };
+      if (!a || d.status !== "playing" || a.getState() !== "playing" || isSuppressed()) return;
+      // Pengirim terakhir (atau jika belum ada pengirim) menyiarkan heartbeat
+      if (d.by && d.by !== selfClientId && d.by !== selfUserId) return;
+      const s: SyncState = { ...d, position: a.getCurrentTime(), updatedAt: serverNow(), by: selfClientId };
       desired.current = s;
-      const evt: SyncEvent = { type: "heartbeat", state: s, sentAt: s.updatedAt, senderId: selfId };
+      const item = queueRef.current.find((i) => i.id === s.itemId) ?? null;
+      const evt: SyncEvent = { type: "heartbeat", state: s, item, sentAt: s.updatedAt, senderId: selfClientId };
       channel.send("sync", evt);
       persist();
     }, HEARTBEAT_MS);
     return () => window.clearInterval(id);
-  }, [channel, persist, selfId]);
+  }, [channel, persist, selfClientId, selfUserId]);
 
   useEffect(
     () => () => {
@@ -373,8 +432,8 @@ export function usePlaybackSync({ roomId, selfId, channel, initial, queue, start
   );
 
   const controls = useMemo(
-    () => ({ play, pause, seekTo, seekBy, next, changeVideo, resync: requestState }),
-    [play, pause, seekTo, seekBy, next, changeVideo, requestState],
+    () => ({ play, unlockAndPlay, pause, seekTo, seekBy, next, changeVideo, resync: requestState }),
+    [play, unlockAndPlay, pause, seekTo, seekBy, next, changeVideo, requestState],
   );
   const player = useMemo(
     () => ({
@@ -391,6 +450,8 @@ export function usePlaybackSync({ roomId, selfId, channel, initial, queue, start
   return {
     state,
     playerState,
+    autoplayBlocked,
+    peersBuffering,
     controls,
     player,
     getAdapter: () => adapter.current,

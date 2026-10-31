@@ -20,13 +20,13 @@ export function Avatar({ name, online = true, size = 32 }: { name: string; onlin
   );
 }
 
-export default function PresenceBar({ online, selfId }: { online: PresenceMeta[]; selfId: string }) {
-  const partnerOnline = online.some((p) => p.userId !== selfId);
+export default function PresenceBar({ online, selfClientId }: { online: PresenceMeta[]; selfClientId: string }) {
+  const partnerOnline = online.some((p) => p.clientId !== selfClientId);
   return (
     <div className="flex items-center gap-2" aria-label="Peserta online">
       <div className="flex -space-x-2">
         {online.map((p) => (
-          <Avatar key={p.userId} name={p.name} />
+          <Avatar key={p.clientId} name={p.name} />
         ))}
       </div>
       <span className="hidden text-xs text-muted sm:inline">
@@ -35,4 +35,3 @@ export default function PresenceBar({ online, selfId }: { online: PresenceMeta[]
     </div>
   );
 }
-

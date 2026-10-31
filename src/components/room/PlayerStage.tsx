@@ -16,8 +16,6 @@ export interface FloatingReaction {
 interface Props {
   item: QueueItem | null;
   sync: ReturnType<typeof usePlaybackSync>;
-  started: boolean;
-  onStart: () => void;
   reactions: FloatingReaction[];
   peersBuffering: string[];
   fill: boolean;
@@ -25,7 +23,7 @@ interface Props {
 
 const AUTO_SKIP_SECONDS = 8;
 
-export default function PlayerStage({ item, sync, started, onStart, reactions, peersBuffering, fill }: Props) {
+export default function PlayerStage({ item, sync, reactions, peersBuffering, fill }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [countdown, setCountdown] = useState<number | null>(null);
 
@@ -62,7 +60,7 @@ export default function PlayerStage({ item, sync, started, onStart, reactions, p
         </div>
       )}
 
-      {item && started && !error && (
+      {item && !error && (
         <VideoPlayer
           key={item.id}
           item={item}
@@ -80,21 +78,18 @@ export default function PlayerStage({ item, sync, started, onStart, reactions, p
         />
       )}
 
-      {item && !started && (
-        <div className="absolute inset-0 grid place-items-center">
-          {item.thumbnail && (
-            // eslint-disable-next-line @next/next/no-img-element
-            <img src={item.thumbnail} alt="" className="absolute inset-0 h-full w-full object-cover opacity-30 blur-sm" />
-          )}
-          <div className="relative flex flex-col items-center gap-3 p-4 text-center">
-            <p className="line-clamp-2 max-w-md text-sm text-white/80">{item.title}</p>
+      {/* Jika browser memblokir autoplay bersuara (mis. baru refresh halaman), tampilkan tombol satu ketukan */}
+      {item && !error && sync.autoplayBlocked && (
+        <div className="absolute inset-0 z-10 grid place-items-center bg-black/60 backdrop-blur-[2px]">
+          <div className="flex flex-col items-center gap-2 p-4 text-center">
             <button
-              onClick={onStart}
-              className="rounded-full bg-accent-strong px-6 py-3 font-semibold text-white shadow-lg shadow-pink-500/20 hover:bg-accent"
+              type="button"
+              onClick={sync.controls.unlockAndPlay}
+              className="rounded-full bg-accent-strong px-6 py-3 font-semibold text-white shadow-lg shadow-pink-500/30 hover:bg-accent"
             >
-              ▶ Gabung dan mulai
+              🔊 Klik untuk mulai & sinkronkan
             </button>
-            <p className="text-xs text-white/60">Browser butuh satu ketukan sebelum video bersuara bisa diputar.</p>
+            <p className="text-xs text-white/80">Video sedang diputar bersama — ketuk sekali untuk mengaktifkan suara.</p>
           </div>
         </div>
       )}
@@ -131,14 +126,14 @@ export default function PlayerStage({ item, sync, started, onStart, reactions, p
         </div>
       )}
 
-      {peersBuffering.length > 0 && started && (
-        <div className="pointer-events-none absolute left-3 top-3 rounded-full bg-black/70 px-3 py-1 text-xs text-white">
+      {peersBuffering.length > 0 && (
+        <div className="pointer-events-none absolute left-3 top-3 z-10 rounded-full bg-black/70 px-3 py-1 text-xs text-white">
           ⏳ {peersBuffering.join(", ")} sedang buffering…
         </div>
       )}
 
-      {sync.playerState === "buffering" && started && (
-        <div className="pointer-events-none absolute right-3 top-3 rounded-full bg-black/70 px-3 py-1 text-xs text-white">
+      {sync.playerState === "buffering" && (
+        <div className="pointer-events-none absolute right-3 top-3 z-10 rounded-full bg-black/70 px-3 py-1 text-xs text-white">
           Memuat…
         </div>
       )}

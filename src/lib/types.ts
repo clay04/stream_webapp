@@ -67,7 +67,7 @@ export interface SyncState {
   playlistIndex: number;
   /** Waktu (ms, jam server terkoreksi) saat `position` berlaku. */
   updatedAt: number;
-  /** User yang terakhir mengubah state. */
+  /** Client/User yang terakhir mengubah state. */
   by: string | null;
 }
 
@@ -76,7 +76,8 @@ export type SyncEventType = "play" | "pause" | "seek" | "change_video" | "rate_c
 export interface SyncEvent {
   type: SyncEventType;
   state: SyncState;
-  /** Info sumber, agar penerima bisa memuat video meski antreannya belum ter-refresh. */
+  /** Objek QueueItem disertakan agar penerima bisa langsung memutar tanpa menunggu query DB. */
+  item?: QueueItem | null;
   videoId?: string | null;
   source?: QueueSource | null;
   sentAt: number;
@@ -84,11 +85,10 @@ export interface SyncEvent {
 }
 
 export interface PresenceMeta {
+  clientId: string;
   userId: string;
   name: string;
   onlineAt: number;
-  buffering?: boolean;
   inCall?: boolean;
   camOn?: boolean;
 }
-

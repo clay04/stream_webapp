@@ -6,8 +6,9 @@ import type { RoomData } from "@/app/room/[code]/RoomClient";
 import { useRoomChannel } from "@/hooks/useRoomChannel";
 import { usePlaybackSync } from "@/hooks/usePlaybackSync";
 import { useWebRTC } from "@/hooks/useWebRTC";
+import { getClientId } from "@/lib/identity";
 import { loadQueue } from "@/lib/queue";
-import type { ChatMessage, Room, SyncState } from "@/lib/types";
+import type { ChatMessage, QueueItem, Room, SyncState } from "@/lib/types";
 import AddVideoForm from "./AddVideoForm";
 import CallBar from "./CallBar";
 import ChatPanel from "./ChatPanel";
@@ -27,11 +28,11 @@ interface Props {
 
 export default function RoomView({ initial, userId, userName }: Props) {
   const router = useRouter();
+  const [clientId] = useState(() => getClientId());
   const [room, setRoom] = useState<Room>(initial.room);
   const [queue, setQueue] = useState(initial.queue);
   const [names, setNames] = useState<Record<string, string>>({ ...initial.profiles, [userId]: userName });
   const [messages, setMessages] = useState<ChatMessage[]>(initial.messages);
-  const [started, setStarted] = useState(false);
   const [tab, setTab] = useState<Tab>("queue");
   const [focus, setFocus] = useState(false);
   const [unread, setUnread] = useState(0);
@@ -40,7 +41,7 @@ export default function RoomView({ initial, userId, userName }: Props) {
   tabRef.current = tab;
   const stageRef = useRef<HTMLDivElement>(null);
 
-  const self = useMemo(() => ({ userId, name: userName }), [userId, userName]);
+  const self = useMemo(() => ({ clientId, userId, name: userName }), [clientId, userId, userName]);
   const { status, online, api } = useRoomChannel(room.id, self);
 
   const refreshQueue = useCallback(async () => {
@@ -50,6 +51,13 @@ export default function RoomView({ initial, userId, userName }: Props) {
       /* abaikan, coba lagi di event berikutnya */
     }
   }, [room.id]);
+
+  const upsertQueueItem = useCallback((item: QueueItem) => {
+    setQueue((prev) => {
+      if (prev.some((q) => q.id === item.id)) return prev;
+      return [...prev, item].sort((a, b) => a.position - b.position);
+    });
+  }, []);
 
   const initialSync = useMemo<SyncState>(() => {
     const s = initial.state;
@@ -66,20 +74,21 @@ export default function RoomView({ initial, userId, userName }: Props) {
 
   const sync = usePlaybackSync({
     roomId: room.id,
-    selfId: userId,
+    selfClientId: clientId,
+    selfUserId: userId,
+    selfName: userName,
     channel: api,
     initial: initialSync,
     queue,
-    started,
     onUnknownItem: refreshQueue,
+    onItemReceived: upsertQueueItem,
   });
 
-  const onlineUserIds = useMemo(() => online.map((p) => p.userId), [online]);
   const rtc = useWebRTC({
-    selfId: userId,
+    selfClientId: clientId,
     selfName: userName,
     channel: api,
-    onlineUserIds,
+    online,
     onVolumeDuck: (ducked) => {
       sync.getAdapter()?.setVolume(ducked ? 0.25 : 1);
     },
@@ -142,7 +151,7 @@ export default function RoomView({ initial, userId, userName }: Props) {
       let changed = false;
       const next = { ...n };
       for (const p of online) {
-        if (next[p.userId] !== p.name) {
+        if (p.userId && next[p.userId] !== p.name) {
           next[p.userId] = p.name;
           changed = true;
         }
@@ -156,7 +165,6 @@ export default function RoomView({ initial, userId, userName }: Props) {
   }, [tab]);
 
   const currentItem = queue.find((i) => i.id === sync.state.itemId) ?? null;
-  const peersBuffering = online.filter((p) => p.userId !== userId && p.buffering).map((p) => p.name);
 
   const panel = (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -189,7 +197,10 @@ export default function RoomView({ initial, userId, userName }: Props) {
             queue={queue}
             currentId={sync.state.itemId}
             names={names}
-            onPlay={(id) => sync.controls.changeVideo(id)}
+            onPlay={(id) => {
+              const target = queue.find((q) => q.id === id) ?? null;
+              sync.controls.changeVideo(id, target);
+            }}
             onChanged={notifyQueue}
           />
         )}
@@ -242,7 +253,7 @@ export default function RoomView({ initial, userId, userName }: Props) {
               )}
             </p>
           </div>
-          <PresenceBar online={online} selfId={userId} />
+          <PresenceBar online={online} selfClientId={clientId} />
         </header>
       )}
 
@@ -252,10 +263,8 @@ export default function RoomView({ initial, userId, userName }: Props) {
             <PlayerStage
               item={currentItem}
               sync={sync}
-              started={started}
-              onStart={() => setStarted(true)}
               reactions={reactions}
-              peersBuffering={peersBuffering}
+              peersBuffering={sync.peersBuffering}
               fill={focus}
             />
           </div>
@@ -274,7 +283,7 @@ export default function RoomView({ initial, userId, userName }: Props) {
             }}
             onReact={sendReaction}
           />
-          <CallBar rtc={rtc} selfId={userId} selfName={userName} online={online} />
+          <CallBar rtc={rtc} selfClientId={clientId} selfName={userName} online={online} />
           {!focus && (
             <div className="border-b border-border px-3 py-3 sm:px-4 lg:border-b-0">
               <AddVideoForm
@@ -283,9 +292,9 @@ export default function RoomView({ initial, userId, userName }: Props) {
                 queue={queue}
                 currentId={sync.state.itemId}
                 onAdded={(item, playNow) => {
-                  setQueue((q) => [...q, item].sort((a, b) => a.position - b.position));
+                  upsertQueueItem(item);
                   api.send("queue", { at: Date.now() });
-                  if (playNow || !sync.state.itemId) sync.controls.changeVideo(item.id);
+                  if (playNow || !sync.state.itemId) sync.controls.changeVideo(item.id, item);
                 }}
               />
             </div>
@@ -301,4 +310,3 @@ export default function RoomView({ initial, userId, userName }: Props) {
     </div>
   );
 }
-
