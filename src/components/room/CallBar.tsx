@@ -165,15 +165,29 @@ export default function CallBar({ rtc, selfClientId, selfName, online }: Props) 
               <button
                 type="button"
                 onClick={() => void rtc.toggleCam()}
-                aria-pressed={rtc.camOn}
+                aria-pressed={rtc.camOn && !rtc.screenSharing}
                 className={`rounded-lg px-2.5 py-1.5 text-xs font-medium transition ${
-                  rtc.camOn
+                  rtc.camOn && !rtc.screenSharing
                     ? "bg-accent/20 text-pink-200 ring-1 ring-accent/50"
                     : "bg-surface-2 text-white hover:bg-border"
                 }`}
                 title={rtc.camOn ? "Matikan kamera" : "Nyalakan kamera"}
               >
-                {rtc.camOn ? "📷 Kamera ON" : "📷 Kamera OFF"}
+                {rtc.camOn && !rtc.screenSharing ? "📷 Kamera ON" : "📷 Kamera OFF"}
+              </button>
+
+              <button
+                type="button"
+                onClick={() => void rtc.toggleScreenShare()}
+                aria-pressed={rtc.screenSharing}
+                className={`rounded-lg px-2.5 py-1.5 text-xs font-medium transition ${
+                  rtc.screenSharing
+                    ? "bg-accent/20 text-pink-200 ring-1 ring-accent/50"
+                    : "bg-surface-2 text-white hover:bg-border"
+                }`}
+                title="Bagikan layar / tab browser beserta suaranya"
+              >
+                {rtc.screenSharing ? "🖥️ Stop Share" : "🖥️ Share Layar"}
               </button>
 
               <button

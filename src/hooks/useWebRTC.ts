@@ -67,6 +67,7 @@ export function useWebRTC({ selfClientId, selfName, channel, online, onVolumeDuc
   const [connecting, setConnecting] = useState(false);
   const [micMuted, setMicMuted] = useState(false);
   const [camOn, setCamOn] = useState(false);
+  const [screenSharing, setScreenSharing] = useState(false);
   const [autoDuck, setAutoDuck] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
@@ -76,6 +77,7 @@ export function useWebRTC({ selfClientId, selfName, channel, online, onVolumeDuc
   const inCallRef = useRef(false);
   const micMutedRef = useRef(false);
   const camOnRef = useRef(false);
+  const screenSharingRef = useRef(false);
   const autoDuckRef = useRef(true);
   autoDuckRef.current = autoDuck;
 
@@ -363,9 +365,11 @@ export function useWebRTC({ selfClientId, selfName, channel, online, onVolumeDuc
   const leaveCall = useCallback(() => {
     if (!inCallRef.current) return;
     inCallRef.current = false;
+    screenSharingRef.current = false;
     setInCall(false);
     setMicMuted(false);
     setCamOn(false);
+    setScreenSharing(false);
     setSpeaking({});
 
     for (const peerId of Array.from(peersRef.current.keys())) {
@@ -462,6 +466,92 @@ export function useWebRTC({ selfClientId, selfName, channel, online, onVolumeDuc
       } catch (err) {
         setError((err as Error).message || "Tidak bisa menyalakan kamera.");
       }
+    }
+  }, [channel, selfClientId, selfName, sendOffer]);
+
+  // ---------- Share Screen + Audio Tab (F13b) ----------
+  const toggleScreenShare = useCallback(async () => {
+    const stream = localStreamRef.current;
+    if (!stream || !inCallRef.current) return;
+    setError(null);
+
+    if (screenSharingRef.current) {
+      for (const track of stream.getVideoTracks()) {
+        track.stop();
+        stream.removeTrack(track);
+        for (const [peerId, p] of peersRef.current.entries()) {
+          const sender = p.pc.getSenders().find((s) => s.track === track);
+          if (sender) p.pc.removeTrack(sender);
+          void sendOffer(peerId, p);
+        }
+      }
+      screenSharingRef.current = false;
+      camOnRef.current = false;
+      setScreenSharing(false);
+      setCamOn(false);
+      setLocalStream(new MediaStream(stream.getTracks()));
+      channel.updatePresence({ inCall: true, camOn: false });
+      channel.send("rtc", {
+        type: "media-state",
+        from: selfClientId,
+        name: selfName,
+        micMuted: micMutedRef.current,
+        camOn: false,
+      } satisfies RtcSignal);
+      return;
+    }
+
+    try {
+      const displayStream = await navigator.mediaDevices.getDisplayMedia({
+        video: true,
+        audio: true,
+      });
+      const screenTrack = displayStream.getVideoTracks()[0];
+      if (!screenTrack) return;
+
+      // Hentikan video kamera sebelumnya bila ada
+      for (const oldTrack of stream.getVideoTracks()) {
+        oldTrack.stop();
+        stream.removeTrack(oldTrack);
+        for (const p of peersRef.current.values()) {
+          const sender = p.pc.getSenders().find((s) => s.track === oldTrack);
+          if (sender) p.pc.removeTrack(sender);
+        }
+      }
+
+      stream.addTrack(screenTrack);
+      const tabAudioTrack = displayStream.getAudioTracks()[0];
+      if (tabAudioTrack) {
+        stream.addTrack(tabAudioTrack);
+      }
+
+      for (const [peerId, p] of peersRef.current.entries()) {
+        p.pc.addTrack(screenTrack, stream);
+        if (tabAudioTrack) p.pc.addTrack(tabAudioTrack, stream);
+        void sendOffer(peerId, p);
+      }
+
+      screenTrack.onended = () => {
+        if (screenSharingRef.current) {
+          void toggleScreenShare();
+        }
+      };
+
+      screenSharingRef.current = true;
+      camOnRef.current = true;
+      setScreenSharing(true);
+      setCamOn(true);
+      setLocalStream(new MediaStream(stream.getTracks()));
+      channel.updatePresence({ inCall: true, camOn: true });
+      channel.send("rtc", {
+        type: "media-state",
+        from: selfClientId,
+        name: selfName,
+        micMuted: micMutedRef.current,
+        camOn: true,
+      } satisfies RtcSignal);
+    } catch (err) {
+      setError((err as Error).message || "Batal membagikan layar.");
     }
   }, [channel, selfClientId, selfName, sendOffer]);
 
@@ -676,6 +766,7 @@ export function useWebRTC({ selfClientId, selfName, channel, online, onVolumeDuc
     connecting,
     micMuted,
     camOn,
+    screenSharing,
     autoDuck,
     setAutoDuck,
     error,
@@ -686,6 +777,7 @@ export function useWebRTC({ selfClientId, selfName, channel, online, onVolumeDuc
     leaveCall,
     toggleMic,
     toggleCam,
+    toggleScreenShare,
   };
 }
 
