@@ -36,6 +36,9 @@ export default function RoomView({ initial, userId, userName }: Props) {
   const [tab, setTab] = useState<Tab>("queue");
   const [focus, setFocus] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [videoVolume, setVideoVolume] = useState(1);
+  const [callVolume, setCallVolume] = useState(1);
+  const [isDucked, setIsDucked] = useState(false);
   const [unread, setUnread] = useState(0);
   const [reactions, setReactions] = useState<FloatingReaction[]>([]);
   const tabRef = useRef(tab);
@@ -99,9 +102,15 @@ export default function RoomView({ initial, userId, userName }: Props) {
     channel: api,
     online,
     onVolumeDuck: (ducked) => {
-      sync.getAdapter()?.setVolume(ducked ? 0.25 : 1);
+      setIsDucked(ducked);
     },
   });
+
+  const effectiveVideoVolume = isDucked ? videoVolume * 0.25 : videoVolume;
+
+  useEffect(() => {
+    sync.controls.setVolume(effectiveVideoVolume);
+  }, [effectiveVideoVolume, sync.controls]);
 
   const notifyQueue = useCallback(() => {
     api.send("queue", { at: Date.now() });
@@ -178,7 +187,17 @@ export default function RoomView({ initial, userId, userName }: Props) {
     <div className="flex min-h-0 flex-1 flex-col">
       {/* Panel Voice Call & Video Call di bagian atas Sidebar Kanan */}
       {!showOverlayCall && (
-        <CallBar rtc={rtc} selfClientId={clientId} selfName={userName} online={online} mode="sidebar" />
+        <CallBar
+          rtc={rtc}
+          selfClientId={clientId}
+          selfName={userName}
+          online={online}
+          callVolume={callVolume}
+          onCallVolumeChange={setCallVolume}
+          videoVolume={videoVolume}
+          onVideoVolumeChange={setVideoVolume}
+          mode="sidebar"
+        />
       )}
 
       <div role="tablist" aria-label="Panel room" className="flex shrink-0 border-b border-border">
@@ -250,7 +269,7 @@ export default function RoomView({ initial, userId, userName }: Props) {
   return (
     <div className="flex h-dvh flex-col">
       {/* Audio panggilan tetap hidup meskipun beralih antara mode normal dan Fullscreen/Fokus */}
-      <CallAudioRenderer peers={rtc.peers} />
+      <CallAudioRenderer peers={rtc.peers} volume={callVolume} />
 
       {!focus && (
         <header className="flex shrink-0 items-center gap-3 border-b border-border px-3 py-2 sm:px-4">
@@ -281,13 +300,24 @@ export default function RoomView({ initial, userId, userName }: Props) {
               sync={sync}
               screenShare={rtc.activeScreenShare}
               onStopScreenShare={() => void rtc.toggleScreenShare()}
+              videoVolume={effectiveVideoVolume}
               reactions={reactions}
               peersBuffering={sync.peersBuffering}
               fill={focus}
             />
             {/* Saat Fullscreen atau Mode Fokus, tampilan Voice/Video Call tetap melayang bersama video utama */}
             {showOverlayCall && (
-              <CallBar rtc={rtc} selfClientId={clientId} selfName={userName} online={online} mode="overlay" />
+              <CallBar
+                rtc={rtc}
+                selfClientId={clientId}
+                selfName={userName}
+                online={online}
+                callVolume={callVolume}
+                onCallVolumeChange={setCallVolume}
+                videoVolume={videoVolume}
+                onVideoVolumeChange={setVideoVolume}
+                mode="overlay"
+              />
             )}
           </div>
           <ControlBar
@@ -296,6 +326,10 @@ export default function RoomView({ initial, userId, userName }: Props) {
             hasItem={!!currentItem}
             hasNext={queue.length > 0}
             focus={focus}
+            videoVolume={videoVolume}
+            onVideoVolumeChange={setVideoVolume}
+            callVolume={callVolume}
+            onCallVolumeChange={setCallVolume}
             onToggleFocus={() => setFocus((f) => !f)}
             onFullscreen={() => {
               const el = stageRef.current;

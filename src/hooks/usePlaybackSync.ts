@@ -76,6 +76,7 @@ export function usePlaybackSync({
   const pauseTimer = useRef<number | null>(null);
   const persistTimer = useRef<number | null>(null);
   const bufferingRef = useRef(false);
+  const volumeRef = useRef(1);
   const peersBufferingMap = useRef(new Map<string, string>());
 
   const suppress = (ms = 1200) => {
@@ -235,11 +236,18 @@ export function usePlaybackSync({
     (a: PlayerAdapter) => {
       adapter.current = a;
       lastSample.current = null;
+      a.setVolume(volumeRef.current);
       suppress(1500);
       reconcile(EVENT_THRESHOLD, true);
     },
     [reconcile],
   );
+
+  const setVolume = useCallback((vol: number) => {
+    const clamped = Math.min(1, Math.max(0, vol));
+    volumeRef.current = clamped;
+    adapter.current?.setVolume(clamped);
+  }, []);
 
   const handleEnded = useCallback(() => {
     const n = nextQueueItem(queueRef.current, desired.current.itemId);
@@ -432,8 +440,8 @@ export function usePlaybackSync({
   );
 
   const controls = useMemo(
-    () => ({ play, unlockAndPlay, pause, seekTo, seekBy, next, changeVideo, resync: requestState }),
-    [play, unlockAndPlay, pause, seekTo, seekBy, next, changeVideo, requestState],
+    () => ({ play, unlockAndPlay, pause, seekTo, seekBy, next, changeVideo, resync: requestState, setVolume }),
+    [play, unlockAndPlay, pause, seekTo, seekBy, next, changeVideo, requestState, setVolume],
   );
   const player = useMemo(
     () => ({

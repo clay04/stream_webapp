@@ -36,6 +36,7 @@ interface MediaStatePayload {
   micMuted: boolean;
   camOn: boolean;
   screenSharing: boolean;
+  callStreamId: string | null;
   screenStreamId: string | null;
 }
 
@@ -58,15 +59,18 @@ interface PeerInternal {
   inCall: boolean;
   stream: MediaStream;
   screenStream: MediaStream;
-  rawStreams: Map<string, MediaStream>;
+  streamTracks: Map<string, Set<MediaStreamTrack>>;
+  knownScreenStreamIds: Set<string>;
   fallbackTracks: Set<MediaStreamTrack>;
   streamVersion: number;
   micMuted: boolean;
   camOn: boolean;
   screenSharing: boolean;
+  callStreamId: string | null;
   screenStreamId: string | null;
   hasConnectedOnce: boolean;
   makingOffer: boolean;
+  needsNegotiation: boolean;
   ignoreOffer: boolean;
   isSettingRemoteAnswerPending: boolean;
   pendingCandidates: RTCIceCandidateInit[];
@@ -81,6 +85,12 @@ interface Options {
   channel: RoomChannel;
   online: PresenceMeta[];
   onVolumeDuck: (ducked: boolean) => void;
+}
+
+function sameTracks(a: MediaStream, b: MediaStreamTrack[]): boolean {
+  const cur = a.getTracks();
+  if (cur.length !== b.length) return false;
+  return cur.every((t) => b.some((x) => x.id === t.id));
 }
 
 function saveCallSessionState(state: { inCall: boolean; camOn: boolean; micMuted: boolean } | null) {
@@ -109,6 +119,8 @@ function loadCallSessionState(): { inCall: boolean; camOn: boolean; micMuted: bo
 
 /**
  * WebRTC Voice Call, Video Call, dan Share Screen terpisah:
+ * - Koneksi yang sudah aktif (`RTCPeerConnection`) dipertahankan saat menyalakan/mematikan Share Screen
+ *   maupun kamera sehingga panggilan tidak pernah terputus.
  * - Setiap muat ulang halaman memiliki `sessionId` baru sehingga peer lama otomatis di-reset bersih (tidak tekancing).
  * - Menyimpan status panggilan di `sessionStorage` agar saat halaman di-refresh tanpa menutup call, otomatis gabung kembali.
  */
@@ -126,7 +138,7 @@ export function useWebRTC({ selfClientId, selfName, channel, online, onVolumeDuc
   const [peers, setPeers] = useState<RemotePeer[]>([]);
   const [speaking, setSpeaking] = useState<Record<string, boolean>>({});
 
-  /** ID unik per siklus hidup halaman/call untuk mendeteksi bila pasangan baru saja me-refresh halaman. */
+  /** ID unik per sesi koneksi untuk mendeteksi bila pasangan baru saja me-refresh halaman. */
   const sessionIdRef = useRef<string>(typeof crypto !== "undefined" ? crypto.randomUUID() : String(Date.now()));
   const inCallRef = useRef(false);
   const micMutedRef = useRef(false);
@@ -134,6 +146,9 @@ export function useWebRTC({ selfClientId, selfName, channel, online, onVolumeDuc
   const screenSharingRef = useRef(false);
   const autoDuckRef = useRef(true);
   autoDuckRef.current = autoDuck;
+
+  const onlineRef = useRef(online);
+  onlineRef.current = online;
 
   const localStreamRef = useRef<MediaStream | null>(null);
   const localScreenStreamRef = useRef<MediaStream | null>(null);
@@ -153,6 +168,7 @@ export function useWebRTC({ selfClientId, selfName, channel, online, onVolumeDuc
       micMuted: micMutedRef.current,
       camOn: camOnRef.current,
       screenSharing: screenSharingRef.current,
+      callStreamId: localStreamRef.current?.id ?? null,
       screenStreamId: localScreenStreamRef.current?.id ?? null,
     }),
     [],
@@ -216,6 +232,7 @@ export function useWebRTC({ selfClientId, selfName, channel, online, onVolumeDuc
         p.pc.onicecandidate = null;
         p.pc.ontrack = null;
         p.pc.onnegotiationneeded = null;
+        p.pc.onsignalingstatechange = null;
         p.pc.onconnectionstatechange = null;
         p.pc.close();
       } catch {
@@ -228,22 +245,31 @@ export function useWebRTC({ selfClientId, selfName, channel, online, onVolumeDuc
   );
 
   /**
-   * Bangun ulang objek MediaStream baru setiap kali track berubah agar elemen `<video>`
-   * di browser selalu me-refresh decoder videonya (mencegah video membeku / tekancing).
+   * Pisahkan track Panggilan (mic/webcam) dan track Share Screen ke masing-masing MediaStream.
+   * Hanya membuat instance MediaStream baru untuk stream yang daftar track-nya benar-benar berubah,
+   * sehingga memulai/menghentikan Share Screen tidak menyentuh stream suara/video panggilan.
    */
   const routePeerTracks = useCallback(
-    (peer: PeerInternal) => {
+    (peer: PeerInternal): boolean => {
       const callTracks: MediaStreamTrack[] = [];
       const screenTracks: MediaStreamTrack[] = [];
 
-      for (const [streamId, rawStream] of peer.rawStreams.entries()) {
-        const isScreen = peer.screenStreamId !== null && streamId === peer.screenStreamId;
-        for (const t of rawStream.getTracks()) {
+      for (const [streamId, trackSet] of peer.streamTracks.entries()) {
+        const isScreen =
+          (peer.screenStreamId !== null && streamId === peer.screenStreamId) ||
+          peer.knownScreenStreamIds.has(streamId);
+
+        for (const t of trackSet) {
           if (t.readyState === "ended") continue;
           if (isScreen) {
-            if (!screenTracks.some((x) => x.id === t.id)) screenTracks.push(t);
+            if (peer.screenSharing && !screenTracks.some((x) => x.id === t.id)) {
+              screenTracks.push(t);
+            }
           } else {
-            if (!callTracks.some((x) => x.id === t.id)) callTracks.push(t);
+            if (t.kind === "video" && !peer.camOn) continue;
+            if (!callTracks.some((x) => x.id === t.id)) {
+              callTracks.push(t);
+            }
           }
         }
       }
@@ -254,23 +280,40 @@ export function useWebRTC({ selfClientId, selfName, channel, online, onVolumeDuc
         if (isScreen) {
           if (!screenTracks.some((x) => x.id === t.id)) screenTracks.push(t);
         } else {
+          if (t.kind === "video" && !peer.camOn) continue;
           if (!callTracks.some((x) => x.id === t.id)) callTracks.push(t);
         }
       }
 
-      peer.stream = new MediaStream(callTracks);
-      peer.screenStream = peer.screenSharing ? new MediaStream(screenTracks) : new MediaStream();
+      const nextScreenTracks = peer.screenSharing ? screenTracks : [];
+      let updated = false;
 
-      if (callTracks.some((t) => t.kind === "audio")) {
+      if (!sameTracks(peer.stream, callTracks)) {
+        peer.stream = new MediaStream(callTracks);
+        updated = true;
         try {
           peer.sourceNode?.disconnect();
         } catch {
           /* abaikan */
         }
-        const { analyser, sourceNode } = attachStreamAnalyser(peer.stream);
-        peer.analyser = analyser;
-        peer.sourceNode = sourceNode;
+        peer.analyser = undefined;
+        peer.sourceNode = undefined;
+        if (callTracks.some((t) => t.kind === "audio")) {
+          const { analyser, sourceNode } = attachStreamAnalyser(peer.stream);
+          peer.analyser = analyser;
+          peer.sourceNode = sourceNode;
+        }
       }
+
+      if (!sameTracks(peer.screenStream, nextScreenTracks)) {
+        peer.screenStream = new MediaStream(nextScreenTracks);
+        updated = true;
+      }
+
+      if (updated) {
+        peer.streamVersion++;
+      }
+      return updated;
     },
     [attachStreamAnalyser],
   );
@@ -278,11 +321,19 @@ export function useWebRTC({ selfClientId, selfName, channel, online, onVolumeDuc
   const sendOffer = useCallback(
     async (peerId: string, peer: PeerInternal) => {
       const { pc } = peer;
-      if (peer.makingOffer || pc.signalingState !== "stable") return;
+      if (pc.connectionState === "closed" || pc.signalingState === "closed") return;
+      if (peer.makingOffer || pc.signalingState !== "stable") {
+        peer.needsNegotiation = true;
+        return;
+      }
       try {
         peer.makingOffer = true;
+        peer.needsNegotiation = false;
         const offer = await pc.createOffer();
-        if (pc.signalingState !== "stable") return;
+        if (pc.signalingState !== "stable") {
+          peer.needsNegotiation = true;
+          return;
+        }
         await pc.setLocalDescription(offer);
         if (pc.localDescription) {
           channel.send("rtc", {
@@ -298,20 +349,45 @@ export function useWebRTC({ selfClientId, selfName, channel, online, onVolumeDuc
         /* abaikan negosiasi gagal sementara */
       } finally {
         peer.makingOffer = false;
+        if (peer.needsNegotiation && pc.signalingState === "stable") {
+          peer.needsNegotiation = false;
+          void sendOffer(peerId, peer);
+        }
       }
     },
     [channel, currentMediaPayload, selfClientId, selfName],
   );
 
+  const syncLocalTracksToPeer = useCallback((peer: PeerInternal) => {
+    const { pc } = peer;
+    if (pc.signalingState === "closed" || pc.connectionState === "closed") return;
+    const senders = pc.getSenders();
+    if (localStreamRef.current) {
+      for (const track of localStreamRef.current.getTracks()) {
+        if (!senders.some((s) => s.track === track)) {
+          pc.addTrack(track, localStreamRef.current);
+        }
+      }
+    }
+    if (localScreenStreamRef.current) {
+      for (const track of localScreenStreamRef.current.getTracks()) {
+        if (!senders.some((s) => s.track === track)) {
+          pc.addTrack(track, localScreenStreamRef.current);
+        }
+      }
+    }
+  }, []);
+
   const getOrCreatePeer = useCallback(
     (peerId: string, peerName: string, meta?: Partial<MediaStatePayload>): PeerInternal => {
       const existing = peersRef.current.get(peerId);
 
-      // Jika peer mengirim sessionId baru (mis. habis refresh halaman) atau koneksi lama sudah rusak,
-      // tutup koneksi lama dan buat RTCPeerConnection baru agar video tidak membeku/tekancing.
+      // Hanya tutup peer lama jika pasangan benar-benar berganti sessionId (mis. habis refresh halaman)
+      // atau jika RTCPeerConnection sudah mati (failed / closed).
       if (existing) {
-        const sessionReplaced =
-          meta?.sessionId && existing.sessionId && existing.sessionId !== meta.sessionId;
+        const sessionReplaced = Boolean(
+          meta?.sessionId && existing.sessionId && existing.sessionId !== meta.sessionId,
+        );
         const connDead =
           existing.pc.connectionState === "failed" || existing.pc.connectionState === "closed";
 
@@ -334,19 +410,38 @@ export function useWebRTC({ selfClientId, selfName, channel, online, onVolumeDuc
             existing.micMuted = meta.micMuted;
             changed = true;
           }
-          if (meta?.camOn !== undefined && existing.camOn !== meta.camOn) {
-            existing.camOn = meta.camOn;
-            existing.streamVersion++;
+          if (meta?.callStreamId !== undefined && existing.callStreamId !== meta.callStreamId) {
+            existing.callStreamId = meta.callStreamId;
             changed = true;
           }
-          if (meta?.screenSharing !== undefined && existing.screenSharing !== meta.screenSharing) {
-            existing.screenSharing = meta.screenSharing;
-            existing.streamVersion++;
+          if (meta?.camOn !== undefined && existing.camOn !== meta.camOn) {
+            // Jika kamera pasangan dimatikan, bersihkan track video kamera lama agar tidak membeku saat dinyalakan lagi
+            if (!meta.camOn) {
+              for (const [sid, set] of existing.streamTracks.entries()) {
+                if (!existing.knownScreenStreamIds.has(sid) && sid !== existing.screenStreamId) {
+                  for (const t of Array.from(set)) {
+                    if (t.kind === "video") set.delete(t);
+                  }
+                }
+              }
+            }
+            existing.camOn = meta.camOn;
             changed = true;
           }
           if (meta?.screenStreamId !== undefined && existing.screenStreamId !== meta.screenStreamId) {
+            if (meta.screenStreamId) {
+              existing.knownScreenStreamIds.add(meta.screenStreamId);
+            }
             existing.screenStreamId = meta.screenStreamId;
-            existing.streamVersion++;
+            changed = true;
+          }
+          if (meta?.screenSharing !== undefined && existing.screenSharing !== meta.screenSharing) {
+            if (!meta.screenSharing) {
+              for (const sid of existing.knownScreenStreamIds) {
+                existing.streamTracks.delete(sid);
+              }
+            }
+            existing.screenSharing = meta.screenSharing;
             changed = true;
           }
           if (changed) {
@@ -358,6 +453,8 @@ export function useWebRTC({ selfClientId, selfName, channel, online, onVolumeDuc
       }
 
       const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+      const knownScreenIds = new Set<string>();
+      if (meta?.screenStreamId) knownScreenIds.add(meta.screenStreamId);
 
       const peer: PeerInternal = {
         pc,
@@ -366,15 +463,18 @@ export function useWebRTC({ selfClientId, selfName, channel, online, onVolumeDuc
         inCall: meta?.inCall ?? false,
         stream: new MediaStream(),
         screenStream: new MediaStream(),
-        rawStreams: new Map(),
+        streamTracks: new Map(),
+        knownScreenStreamIds: knownScreenIds,
         fallbackTracks: new Set(),
         streamVersion: 1,
         micMuted: meta?.micMuted ?? false,
         camOn: meta?.camOn ?? false,
         screenSharing: meta?.screenSharing ?? false,
+        callStreamId: meta?.callStreamId ?? null,
         screenStreamId: meta?.screenStreamId ?? null,
         hasConnectedOnce: false,
         makingOffer: false,
+        needsNegotiation: false,
         ignoreOffer: false,
         isSettingRemoteAnswerPending: false,
         pendingCandidates: [],
@@ -387,35 +487,58 @@ export function useWebRTC({ selfClientId, selfName, channel, online, onVolumeDuc
             from: selfClientId,
             to: peerId,
             name: selfName,
-            sessionId: sessionIdRef.current,
+            ...currentMediaPayload(),
             candidate: candidate.toJSON(),
           } satisfies RtcSignal);
         }
       };
 
       pc.onnegotiationneeded = () => {
-        if (!peer.hasConnectedOnce && selfClientId < peerId) return;
+        if (!peer.hasConnectedOnce) return;
         void sendOffer(peerId, peer);
+      };
+
+      pc.onsignalingstatechange = () => {
+        if (pc.signalingState === "stable" && peer.needsNegotiation) {
+          peer.needsNegotiation = false;
+          void sendOffer(peerId, peer);
+        }
       };
 
       pc.ontrack = ({ track, streams }) => {
         const srcStream = streams[0];
         if (srcStream) {
-          peer.rawStreams.set(srcStream.id, srcStream);
+          let set = peer.streamTracks.get(srcStream.id);
+          if (!set) {
+            set = new Set();
+            peer.streamTracks.set(srcStream.id, set);
+          }
+          set.add(track);
+          for (const t of srcStream.getTracks()) {
+            set.add(t);
+          }
+          srcStream.onremovetrack = ({ track: removed }) => {
+            set?.delete(removed);
+            routePeerTracks(peer);
+            syncPeersState();
+          };
         } else {
           peer.fallbackTracks.add(track);
         }
+
         routePeerTracks(peer);
-        peer.streamVersion++;
 
         track.onunmute = () => {
           routePeerTracks(peer);
-          peer.streamVersion++;
           syncPeersState();
         };
         track.onended = () => {
+          if (srcStream) {
+            peer.streamTracks.get(srcStream.id)?.delete(track);
+          } else {
+            peer.fallbackTracks.delete(track);
+          }
           routePeerTracks(peer);
-          peer.streamVersion++;
           syncPeersState();
         };
         syncPeersState();
@@ -434,29 +557,20 @@ export function useWebRTC({ selfClientId, selfName, channel, online, onVolumeDuc
               if (pc.connectionState === "disconnected" || pc.connectionState === "failed") {
                 closePeer(peerId);
               }
-            }, 5000);
+            }, 6000);
           }
         } else if (pc.connectionState === "failed" || pc.connectionState === "closed") {
           closePeer(peerId);
         }
       };
 
-      if (localStreamRef.current) {
-        for (const track of localStreamRef.current.getTracks()) {
-          pc.addTrack(track, localStreamRef.current);
-        }
-      }
-      if (localScreenStreamRef.current) {
-        for (const track of localScreenStreamRef.current.getTracks()) {
-          pc.addTrack(track, localScreenStreamRef.current);
-        }
-      }
+      syncLocalTracksToPeer(peer);
 
       peersRef.current.set(peerId, peer);
       syncPeersState();
       return peer;
     },
-    [channel, closePeer, routePeerTracks, selfClientId, selfName, sendOffer, syncPeersState],
+    [channel, closePeer, currentMediaPayload, routePeerTracks, selfClientId, selfName, sendOffer, syncLocalTracksToPeer, syncPeersState],
   );
 
   const broadcastState = useCallback(
@@ -477,6 +591,14 @@ export function useWebRTC({ selfClientId, selfName, channel, online, onVolumeDuc
     },
     [channel, currentMediaPayload, selfClientId, selfName],
   );
+
+  const cleanDeadPeers = useCallback(() => {
+    for (const [peerId, p] of Array.from(peersRef.current.entries())) {
+      if (p.pc.connectionState === "failed" || p.pc.connectionState === "closed") {
+        closePeer(peerId);
+      }
+    }
+  }, [closePeer]);
 
   // ---------- Masuk ke panggilan suara/video ----------
   const joinCall = useCallback(
@@ -503,8 +625,13 @@ export function useWebRTC({ selfClientId, selfName, channel, online, onVolumeDuc
           for (const t of stream.getAudioTracks()) t.enabled = false;
         }
 
-        // Buat sessionId baru setiap kali masuk call agar peer di seberang me-reset koneksi lama
-        sessionIdRef.current = crypto.randomUUID();
+        cleanDeadPeers();
+
+        // Hanya rotasi sessionId bila belum ada koneksi aktif (mis. belum ada Share Screen aktif)
+        const hadActivePeers = peersRef.current.size > 0;
+        if (!hadActivePeers) {
+          sessionIdRef.current = crypto.randomUUID();
+        }
 
         localStreamRef.current = stream;
         setLocalStream(stream);
@@ -521,14 +648,26 @@ export function useWebRTC({ selfClientId, selfName, channel, online, onVolumeDuc
         const { analyser } = attachStreamAnalyser(stream);
         localAnalyserRef.current = analyser ?? null;
 
-        for (const [peerId, p] of peersRef.current.entries()) {
-          for (const track of stream.getTracks()) {
-            p.pc.addTrack(track, stream);
+        // Pastikan peer untuk pasangan yang sudah online dibuat sebelum mengirim sinyal
+        for (const p of onlineRef.current) {
+          if (p.clientId === selfClientId) continue;
+          if ((p.inCall || p.screenSharing || screenSharingRef.current) && !peersRef.current.has(p.clientId)) {
+            getOrCreatePeer(p.clientId, p.name, {
+              inCall: p.inCall,
+              camOn: p.camOn,
+              screenSharing: p.screenSharing,
+            });
           }
-          void sendOffer(peerId, p);
         }
 
-        broadcastState("join");
+        for (const [peerId, p] of peersRef.current.entries()) {
+          syncLocalTracksToPeer(p);
+          if (hadActivePeers) {
+            void sendOffer(peerId, p);
+          }
+        }
+
+        broadcastState(hadActivePeers ? "media-state" : "join");
       } catch (err) {
         saveCallSessionState(null);
         setError((err as Error).message || "Gagal mengakses mikrofon/kamera.");
@@ -536,7 +675,7 @@ export function useWebRTC({ selfClientId, selfName, channel, online, onVolumeDuc
         setConnecting(false);
       }
     },
-    [attachStreamAnalyser, broadcastState, connecting, sendOffer],
+    [attachStreamAnalyser, broadcastState, cleanDeadPeers, connecting, getOrCreatePeer, selfClientId, sendOffer, syncLocalTracksToPeer],
   );
 
   // ---------- Keluar dari panggilan suara/video ----------
@@ -551,35 +690,48 @@ export function useWebRTC({ selfClientId, selfName, channel, online, onVolumeDuc
     setCamOn(false);
     setSpeaking({});
 
-    if (localStreamRef.current) {
-      for (const track of localStreamRef.current.getTracks()) {
+    const stream = localStreamRef.current;
+    localStreamRef.current = null;
+    localAnalyserRef.current = null;
+    setLocalStream(null);
+
+    if (stream) {
+      for (const track of stream.getTracks()) {
         track.stop();
-        for (const [peerId, p] of peersRef.current.entries()) {
+        for (const p of peersRef.current.values()) {
           const sender = p.pc.getSenders().find((s) => s.track === track);
-          if (sender) p.pc.removeTrack(sender);
-          if (screenSharingRef.current || p.screenSharing) {
-            void sendOffer(peerId, p);
+          if (sender) {
+            try {
+              p.pc.removeTrack(sender);
+            } catch {
+              /* abaikan */
+            }
           }
         }
       }
-      localStreamRef.current = null;
     }
-    localAnalyserRef.current = null;
-    setLocalStream(null);
 
     if (isDuckedRef.current) {
       isDuckedRef.current = false;
       onVolumeDuckRef.current(false);
     }
 
-    if (!screenSharingRef.current && !Array.from(peersRef.current.values()).some((p) => p.screenSharing)) {
+    const keepForScreen =
+      screenSharingRef.current || Array.from(peersRef.current.values()).some((p) => p.screenSharing);
+
+    if (!keepForScreen) {
+      const oldSession = sessionIdRef.current;
       for (const peerId of Array.from(peersRef.current.keys())) {
         closePeer(peerId);
       }
+      sessionIdRef.current = crypto.randomUUID();
       channel.updatePresence({ inCall: false, camOn: false, screenSharing: false });
-      channel.send("rtc", { type: "leave", from: selfClientId, sessionId: sessionIdRef.current } satisfies RtcSignal);
+      channel.send("rtc", { type: "leave", from: selfClientId, sessionId: oldSession } satisfies RtcSignal);
     } else {
       broadcastState("media-state");
+      for (const [peerId, p] of peersRef.current.entries()) {
+        void sendOffer(peerId, p);
+      }
     }
   }, [broadcastState, channel, closePeer, selfClientId, sendOffer]);
 
@@ -604,20 +756,28 @@ export function useWebRTC({ selfClientId, selfName, channel, online, onVolumeDuc
     setError(null);
 
     if (camOnRef.current) {
+      camOnRef.current = false;
+      setCamOn(false);
       for (const track of stream.getVideoTracks()) {
         track.stop();
         stream.removeTrack(track);
-        for (const [peerId, p] of peersRef.current.entries()) {
+        for (const p of peersRef.current.values()) {
           const sender = p.pc.getSenders().find((s) => s.track === track);
-          if (sender) p.pc.removeTrack(sender);
-          void sendOffer(peerId, p);
+          if (sender) {
+            try {
+              p.pc.removeTrack(sender);
+            } catch {
+              /* abaikan */
+            }
+          }
         }
       }
-      camOnRef.current = false;
-      setCamOn(false);
       setLocalVersion((v) => v + 1);
       saveCallSessionState({ inCall: true, camOn: false, micMuted: micMutedRef.current });
       broadcastState("media-state");
+      for (const [peerId, p] of peersRef.current.entries()) {
+        void sendOffer(peerId, p);
+      }
     } else {
       try {
         const camStream = await navigator.mediaDevices.getUserMedia({
@@ -626,49 +786,63 @@ export function useWebRTC({ selfClientId, selfName, channel, online, onVolumeDuc
         const videoTrack = camStream.getVideoTracks()[0];
         if (!videoTrack) return;
         stream.addTrack(videoTrack);
-        for (const [peerId, p] of peersRef.current.entries()) {
-          p.pc.addTrack(videoTrack, stream);
-          void sendOffer(peerId, p);
-        }
         camOnRef.current = true;
         setCamOn(true);
         setLocalVersion((v) => v + 1);
         saveCallSessionState({ inCall: true, camOn: true, micMuted: micMutedRef.current });
+
         broadcastState("media-state");
+        for (const [peerId, p] of peersRef.current.entries()) {
+          syncLocalTracksToPeer(p);
+          void sendOffer(peerId, p);
+        }
       } catch (err) {
         setError((err as Error).message || "Tidak bisa menyalakan kamera.");
       }
     }
-  }, [broadcastState, sendOffer]);
+  }, [broadcastState, sendOffer, syncLocalTracksToPeer]);
 
   // ---------- Share Screen + Audio Tab ke Panggung Video Utama ----------
   const stopScreenShare = useCallback(() => {
     const screenStream = localScreenStreamRef.current;
     if (!screenStream) return;
-    for (const track of screenStream.getTracks()) {
-      track.stop();
-      for (const [peerId, p] of peersRef.current.entries()) {
-        const sender = p.pc.getSenders().find((s) => s.track === track);
-        if (sender) p.pc.removeTrack(sender);
-        if (inCallRef.current || p.inCall || p.screenSharing) {
-          void sendOffer(peerId, p);
-        }
-      }
-    }
+
     localScreenStreamRef.current = null;
     screenSharingRef.current = false;
     setLocalScreenStream(null);
     setScreenSharing(false);
     setLocalVersion((v) => v + 1);
 
-    if (!inCallRef.current && !Array.from(peersRef.current.values()).some((p) => p.screenSharing)) {
+    for (const track of screenStream.getTracks()) {
+      track.stop();
+      for (const p of peersRef.current.values()) {
+        const sender = p.pc.getSenders().find((s) => s.track === track);
+        if (sender) {
+          try {
+            p.pc.removeTrack(sender);
+          } catch {
+            /* abaikan */
+          }
+        }
+      }
+    }
+
+    const keepForCall =
+      inCallRef.current || Array.from(peersRef.current.values()).some((p) => p.inCall || p.screenSharing);
+
+    if (!keepForCall) {
+      const oldSession = sessionIdRef.current;
       for (const peerId of Array.from(peersRef.current.keys())) {
         closePeer(peerId);
       }
+      sessionIdRef.current = crypto.randomUUID();
       channel.updatePresence({ inCall: false, camOn: false, screenSharing: false });
-      channel.send("rtc", { type: "leave", from: selfClientId, sessionId: sessionIdRef.current } satisfies RtcSignal);
+      channel.send("rtc", { type: "leave", from: selfClientId, sessionId: oldSession } satisfies RtcSignal);
     } else {
       broadcastState("media-state");
+      for (const [peerId, p] of peersRef.current.entries()) {
+        void sendOffer(peerId, p);
+      }
     }
   }, [broadcastState, channel, closePeer, selfClientId, sendOffer]);
 
@@ -680,10 +854,22 @@ export function useWebRTC({ selfClientId, selfName, channel, online, onVolumeDuc
     }
 
     try {
-      const displayStream = await navigator.mediaDevices.getDisplayMedia({
-        video: true,
-        audio: true,
-      });
+      let displayStream: MediaStream;
+      try {
+        displayStream = await navigator.mediaDevices.getDisplayMedia({
+          video: true,
+          audio: true,
+        });
+      } catch (firstErr) {
+        const errName = (firstErr as DOMException)?.name;
+        if (errName === "NotAllowedError" || errName === "AbortError") {
+          return;
+        }
+        displayStream = await navigator.mediaDevices.getDisplayMedia({
+          video: true,
+        });
+      }
+
       const screenTrack = displayStream.getVideoTracks()[0];
       if (!screenTrack) return;
 
@@ -691,24 +877,51 @@ export function useWebRTC({ selfClientId, selfName, channel, online, onVolumeDuc
         stopScreenShare();
       };
 
+      cleanDeadPeers();
+
+      // Jangan ubah sessionId bila sudah ada koneksi peer aktif (mis. sedang Voice/Video Call)
+      const hadActivePeers = peersRef.current.size > 0;
+      if (!hadActivePeers) {
+        sessionIdRef.current = crypto.randomUUID();
+      }
+
       localScreenStreamRef.current = displayStream;
       screenSharingRef.current = true;
       setLocalScreenStream(displayStream);
       setScreenSharing(true);
       setLocalVersion((v) => v + 1);
 
-      for (const [peerId, p] of peersRef.current.entries()) {
-        for (const track of displayStream.getTracks()) {
-          p.pc.addTrack(track, displayStream);
+      // Pastikan peer dibuat untuk semua peserta yang sedang online di room
+      for (const p of onlineRef.current) {
+        if (p.clientId === selfClientId) continue;
+        if (!peersRef.current.has(p.clientId)) {
+          getOrCreatePeer(p.clientId, p.name, {
+            inCall: p.inCall,
+            camOn: p.camOn,
+            screenSharing: p.screenSharing,
+          });
         }
-        void sendOffer(peerId, p);
       }
 
-      broadcastState("join");
+      if (hadActivePeers) {
+        // Beri tahu pasangan bahwa screenStreamId aktif terlebih dahulu, lalu renegosiasi pada koneksi yang sama
+        broadcastState("media-state");
+        for (const [peerId, p] of peersRef.current.entries()) {
+          syncLocalTracksToPeer(p);
+          void sendOffer(peerId, p);
+        }
+      } else {
+        for (const p of peersRef.current.values()) {
+          syncLocalTracksToPeer(p);
+        }
+        broadcastState("join");
+      }
     } catch (err) {
-      setError((err as Error).message || "Batal membagikan layar.");
+      const errName = (err as DOMException)?.name;
+      if (errName === "NotAllowedError" || errName === "AbortError") return;
+      setError((err as Error).message || "Gagal membagikan layar.");
     }
-  }, [broadcastState, sendOffer, stopScreenShare]);
+  }, [broadcastState, cleanDeadPeers, getOrCreatePeer, selfClientId, sendOffer, stopScreenShare, syncLocalTracksToPeer]);
 
   // ---------- Otomatis gabung kembali ke Call jika halaman di-refresh tanpa menutup Call ----------
   useEffect(() => {
@@ -748,6 +961,7 @@ export function useWebRTC({ selfClientId, selfName, channel, online, onVolumeDuc
     const anyRemoteScreen = online.some((p) => p.clientId !== selfClientId && p.screenSharing);
     if (!activeLocal && !anyRemoteScreen) return;
 
+    let addedNewPeer = false;
     for (const p of online) {
       if (p.clientId === selfClientId) continue;
       const shouldConnect = (activeLocal && (p.inCall || p.screenSharing)) || p.screenSharing || screenSharing;
@@ -757,8 +971,11 @@ export function useWebRTC({ selfClientId, selfName, channel, online, onVolumeDuc
           camOn: p.camOn,
           screenSharing: p.screenSharing,
         });
-        broadcastState("join");
+        addedNewPeer = true;
       }
+    }
+    if (addedNewPeer) {
+      broadcastState("join");
     }
   }, [broadcastState, getOrCreatePeer, inCall, online, screenSharing, selfClientId]);
 
@@ -782,28 +999,33 @@ export function useWebRTC({ selfClientId, selfName, channel, online, onVolumeDuc
       if (!activeLocal && !remoteWantsScreen && !hasExistingPeer) return;
 
       if (msg.type === "join") {
-        // Jika menerima "join" baru (bukan reply), tutup peer lama dari pengirim tersebut agar negosiasi ulang bersih
-        if (!msg.reply && peersRef.current.has(msg.from)) {
-          closePeer(msg.from);
-        }
         const peer = getOrCreatePeer(msg.from, msg.name, msg);
+        syncLocalTracksToPeer(peer);
+
         if (!msg.reply) {
           broadcastState("join", true);
         }
-        // Pihak yang menerima "join" awal (atau pihak dengan ID lebih besar saat reply) langsung mengirim Offer
-        if (!msg.reply || selfClientId > msg.from || (screenSharingRef.current && !msg.screenSharing)) {
+
+        const localHasMedia = inCallRef.current || screenSharingRef.current;
+        const remoteHasMedia = Boolean(msg.inCall || msg.screenSharing);
+        const shouldInitiateOffer =
+          localHasMedia && (!remoteHasMedia || selfClientId > msg.from);
+
+        if (shouldInitiateOffer) {
           void sendOffer(msg.from, peer);
         }
         return;
       }
 
       if (msg.type === "media-state") {
-        getOrCreatePeer(msg.from, msg.name, msg);
+        const peer = getOrCreatePeer(msg.from, msg.name, msg);
+        syncLocalTracksToPeer(peer);
         return;
       }
 
       if (msg.type === "signal" && msg.to === selfClientId) {
         const peer = getOrCreatePeer(msg.from, msg.name, msg);
+        syncLocalTracksToPeer(peer);
         const { pc } = peer;
         const polite = selfClientId < msg.from;
 
@@ -851,6 +1073,21 @@ export function useWebRTC({ selfClientId, selfName, channel, online, onVolumeDuc
                 } satisfies RtcSignal);
               }
             }
+
+            // Bila masih ada track lokal (mis. kamera atau share screen) yang belum ternegosiasi, langsung kirim offer lanjutan
+            const hasUnnegotiatedTracks = pc
+              .getTransceivers()
+              .some(
+                (t) =>
+                  t.currentDirection === null &&
+                  t.direction !== "inactive" &&
+                  t.direction !== "stopped" &&
+                  t.sender.track !== null,
+              );
+            if ((peer.needsNegotiation || hasUnnegotiatedTracks) && pc.signalingState === "stable") {
+              peer.needsNegotiation = false;
+              void sendOffer(msg.from, peer);
+            }
           } else if (msg.candidate) {
             try {
               if (pc.remoteDescription && pc.remoteDescription.type) {
@@ -869,7 +1106,7 @@ export function useWebRTC({ selfClientId, selfName, channel, online, onVolumeDuc
     });
 
     return () => off();
-  }, [broadcastState, channel, closePeer, currentMediaPayload, getOrCreatePeer, selfClientId, selfName, sendOffer]);
+  }, [broadcastState, channel, closePeer, currentMediaPayload, getOrCreatePeer, selfClientId, selfName, sendOffer, syncLocalTracksToPeer]);
 
   // ---------- Deteksi Suara (VAD) & Auto-Ducking Volume Video ----------
   useEffect(() => {

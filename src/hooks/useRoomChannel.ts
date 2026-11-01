@@ -142,7 +142,12 @@ export function useRoomChannel(
 
   const updatePresence = useCallback((patch: Partial<PresenceMeta>) => {
     if (!metaRef.current) return;
-    metaRef.current = { ...metaRef.current, ...patch };
+    const next: PresenceMeta = { ...metaRef.current, ...patch };
+    const changed = (Object.keys(patch) as (keyof PresenceMeta)[]).some(
+      (k) => metaRef.current![k] !== next[k],
+    );
+    if (!changed) return;
+    metaRef.current = next;
     const ch = channelRef.current;
     if (ch && subscribedRef.current) {
       void ch.track(metaRef.current);

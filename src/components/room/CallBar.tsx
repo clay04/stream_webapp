@@ -5,25 +5,106 @@ import type { RemotePeer, WebRTCController } from "@/hooks/useWebRTC";
 import type { PresenceMeta } from "@/lib/types";
 import { Avatar } from "./PresenceBar";
 
-/** Pemutar audio persisten agar suara panggilan tidak terputus saat pindah ke Fullscreen / Mode Fokus. */
-export function CallAudioRenderer({ peers }: { peers: RemotePeer[] }) {
+/**
+ * Pemutar audio persisten untuk suara panggilan (Voice/Video Call).
+ * Mendukung pengaturan volume 0%–200% (di atas 100% diperkuat menggunakan Web Audio GainNode).
+ */
+export function CallAudioRenderer({ peers, volume }: { peers: RemotePeer[]; volume: number }) {
   return (
     <div className="sr-only" aria-hidden>
       {peers.map((p) => (
-        <PeerAudio key={p.clientId} stream={p.stream} streamVersion={p.streamVersion} />
+        <PeerAudio key={p.clientId} stream={p.stream} streamVersion={p.streamVersion} volume={volume} />
       ))}
     </div>
   );
 }
 
-function PeerAudio({ stream, streamVersion }: { stream: MediaStream; streamVersion: number }) {
+function PeerAudio({
+  stream,
+  streamVersion,
+  volume,
+}: {
+  stream: MediaStream;
+  streamVersion: number;
+  volume: number;
+}) {
   const audioRef = useRef<HTMLAudioElement>(null);
+  const boostRef = useRef<{
+    ctx: AudioContext;
+    source: MediaStreamAudioSourceNode;
+    gain: GainNode;
+    stream: MediaStream;
+  } | null>(null);
+
   useEffect(() => {
-    if (audioRef.current) {
-      audioRef.current.srcObject = stream;
-      void audioRef.current.play().catch(() => {});
+    const el = audioRef.current;
+    if (!el) return;
+    el.srcObject = stream;
+    el.volume = Math.min(1, Math.max(0, volume));
+    void el.play().catch(() => {});
+  }, [stream, streamVersion, volume]);
+
+  // Penguat tambahan (boost > 100%) menggunakan Web Audio API GainNode
+  useEffect(() => {
+    const extraGain = Math.max(0, volume - 1);
+    const hasAudio = stream.getAudioTracks().some((t) => t.readyState === "live");
+
+    if (extraGain <= 0.01 || !hasAudio) {
+      if (boostRef.current) {
+        boostRef.current.gain.gain.value = 0;
+      }
+      return;
     }
-  }, [stream, streamVersion]);
+
+    if (boostRef.current && boostRef.current.stream !== stream) {
+      try {
+        boostRef.current.source.disconnect();
+        boostRef.current.gain.disconnect();
+        void boostRef.current.ctx.close();
+      } catch {
+        /* abaikan */
+      }
+      boostRef.current = null;
+    }
+
+    if (!boostRef.current) {
+      try {
+        const Ctx =
+          window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+        if (!Ctx) return;
+        const ctx = new Ctx();
+        const source = ctx.createMediaStreamSource(stream);
+        const gain = ctx.createGain();
+        gain.gain.value = extraGain;
+        source.connect(gain);
+        gain.connect(ctx.destination);
+        boostRef.current = { ctx, source, gain, stream };
+      } catch {
+        return;
+      }
+    } else {
+      if (boostRef.current.ctx.state === "suspended") {
+        void boostRef.current.ctx.resume().catch(() => {});
+      }
+      boostRef.current.gain.gain.value = extraGain;
+    }
+  }, [stream, streamVersion, volume]);
+
+  useEffect(() => {
+    return () => {
+      if (boostRef.current) {
+        try {
+          boostRef.current.source.disconnect();
+          boostRef.current.gain.disconnect();
+          void boostRef.current.ctx.close();
+        } catch {
+          /* abaikan */
+        }
+        boostRef.current = null;
+      }
+    };
+  }, []);
+
   return <audio ref={audioRef} autoPlay playsInline />;
 }
 
@@ -60,11 +141,25 @@ interface Props {
   selfClientId: string;
   selfName: string;
   online: PresenceMeta[];
+  callVolume: number;
+  onCallVolumeChange: (v: number) => void;
+  videoVolume: number;
+  onVideoVolumeChange: (v: number) => void;
   /** "sidebar" untuk panel kanan, "overlay" untuk melayang di atas video saat Fullscreen / Mode Fokus. */
   mode: "sidebar" | "overlay";
 }
 
-export default function CallBar({ rtc, selfClientId, selfName, online, mode }: Props) {
+export default function CallBar({
+  rtc,
+  selfClientId,
+  selfName,
+  online,
+  callVolume,
+  onCallVolumeChange,
+  videoVolume,
+  onVideoVolumeChange,
+  mode,
+}: Props) {
   const [minimized, setMinimized] = useState(false);
   const partnersInCall = online.filter((p) => p.clientId !== selfClientId && p.inCall);
   const callPeers = rtc.peers.filter((p) => p.inCall || p.camOn || p.stream.getTracks().length > 0);
@@ -214,7 +309,7 @@ export default function CallBar({ rtc, selfClientId, selfName, online, mode }: P
               }`}
               title="Otomatis kecilkan suara film saat pasangan berbicara"
             >
-              🔉 {rtc.autoDuck ? "ON" : "OFF"}
+              🔉 Auto {rtc.autoDuck ? "ON" : "OFF"}
             </button>
 
             <button
@@ -226,6 +321,49 @@ export default function CallBar({ rtc, selfClientId, selfName, online, mode }: P
               📴
             </button>
           </div>
+
+          {/* Mixer Volume Panggilan vs Volume Video Utama */}
+          {!minimized && (
+            <div className="space-y-1.5 rounded-xl border border-border/70 bg-surface-2/60 p-2.5 text-xs">
+              <div className="flex items-center gap-2">
+                <span className="w-24 shrink-0 text-[11px] text-muted" title="Volume suara pasangan (bisa diperkuat hingga 200%)">
+                  📞 Suara Call
+                </span>
+                <input
+                  type="range"
+                  aria-label="Volume panggilan"
+                  min={0}
+                  max={2}
+                  step={0.05}
+                  value={callVolume}
+                  onChange={(e) => onCallVolumeChange(Number(e.target.value))}
+                  className="h-1 flex-1 cursor-pointer accent-emerald-400"
+                />
+                <span className="w-10 text-right font-mono text-[11px] tabular-nums">
+                  {Math.round(callVolume * 100)}%
+                </span>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <span className="w-24 shrink-0 text-[11px] text-muted" title="Volume video utama">
+                  🎬 Suara Video
+                </span>
+                <input
+                  type="range"
+                  aria-label="Volume video utama"
+                  min={0}
+                  max={1}
+                  step={0.05}
+                  value={videoVolume}
+                  onChange={(e) => onVideoVolumeChange(Number(e.target.value))}
+                  className="h-1 flex-1 cursor-pointer accent-pink-500"
+                />
+                <span className="w-10 text-right font-mono text-[11px] tabular-nums">
+                  {Math.round(videoVolume * 100)}%
+                </span>
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>

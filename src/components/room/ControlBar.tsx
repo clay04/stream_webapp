@@ -21,16 +21,34 @@ interface Props {
   hasItem: boolean;
   hasNext: boolean;
   focus: boolean;
+  videoVolume: number;
+  onVideoVolumeChange: (v: number) => void;
+  callVolume: number;
+  onCallVolumeChange: (v: number) => void;
   onToggleFocus: () => void;
   onFullscreen: () => void;
   onReact: (emoji: string) => void;
 }
 
 /** Bar kontrol bersama: setiap aksi di sini disiarkan ke semua peserta. */
-export default function ControlBar({ sync, rtc, hasItem, hasNext, focus, onToggleFocus, onFullscreen, onReact }: Props) {
+export default function ControlBar({
+  sync,
+  rtc,
+  hasItem,
+  hasNext,
+  focus,
+  videoVolume,
+  onVideoVolumeChange,
+  callVolume,
+  onCallVolumeChange,
+  onToggleFocus,
+  onFullscreen,
+  onReact,
+}: Props) {
   const [time, setTime] = useState({ pos: 0, dur: 0 });
   const [scrub, setScrub] = useState<number | null>(null);
   const [showReactions, setShowReactions] = useState(false);
+  const [showMixer, setShowMixer] = useState(false);
   const { getAdapter, state } = sync;
 
   useEffect(() => {
@@ -93,7 +111,7 @@ export default function ControlBar({ sync, rtc, hasItem, hasNext, focus, onToggl
           🔄
         </button>
 
-        {/* Tombol Share Layar (ditampilkan di panggung video utama) & Voice/Video Call */}
+        {/* Tombol Share Layar & Voice/Video Call */}
         <div className="ml-1 flex items-center gap-1">
           <button
             type="button"
@@ -136,10 +154,127 @@ export default function ControlBar({ sync, rtc, hasItem, hasNext, focus, onToggl
           )}
         </div>
 
-        <div className="relative ml-auto">
+        {/* Pengatur Volume Video Utama & Panggilan (Audio Mixer) */}
+        <div className="relative ml-auto flex items-center gap-1">
+          <div className="hidden items-center gap-1.5 rounded-lg bg-surface-2 px-2.5 py-1.5 sm:flex">
+            <button
+              type="button"
+              onClick={() => onVideoVolumeChange(videoVolume > 0 ? 0 : 1)}
+              className="text-sm"
+              title="Volume Video Utama"
+            >
+              {videoVolume === 0 ? "🔇" : videoVolume < 0.5 ? "🔉" : "🔊"}
+            </button>
+            <input
+              type="range"
+              aria-label="Volume video utama"
+              min={0}
+              max={1}
+              step={0.05}
+              value={videoVolume}
+              onChange={(e) => onVideoVolumeChange(Number(e.target.value))}
+              className="h-1 w-20 cursor-pointer accent-pink-500"
+            />
+          </div>
+
+          <button
+            type="button"
+            className={`${btn} text-base`}
+            onClick={() => {
+              setShowMixer((m) => !m);
+              setShowReactions(false);
+            }}
+            aria-expanded={showMixer}
+            aria-label="Mixer volume video dan panggilan"
+            title="Atur perbandingan suara Video Utama & Panggilan"
+          >
+            🎚️
+          </button>
+
+          {showMixer && (
+            <div className="absolute bottom-12 right-0 z-30 w-72 rounded-2xl border border-border bg-surface-2 p-3.5 shadow-2xl">
+              <div className="mb-2.5 flex items-center justify-between">
+                <span className="text-xs font-semibold">Mixer Suara</span>
+                <div className="flex gap-1">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onCallVolumeChange(1.5);
+                      onVideoVolumeChange(0.35);
+                    }}
+                    className="rounded-md border border-border bg-surface px-2 py-0.5 text-[10px] hover:border-accent"
+                    title="Besarkan suara pasangan, kecilkan suara film"
+                  >
+                    Fokus Call
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onCallVolumeChange(1);
+                      onVideoVolumeChange(1);
+                    }}
+                    className="rounded-md border border-border bg-surface px-2 py-0.5 text-[10px] hover:border-accent"
+                  >
+                    Seimbang
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onCallVolumeChange(0.6);
+                      onVideoVolumeChange(1);
+                    }}
+                    className="rounded-md border border-border bg-surface px-2 py-0.5 text-[10px] hover:border-accent"
+                    title="Besarkan suara film, kecilkan suara panggilan"
+                  >
+                    Fokus Video
+                  </button>
+                </div>
+              </div>
+
+              <div className="space-y-2.5 text-xs">
+                <div>
+                  <div className="mb-1 flex justify-between">
+                    <span className="text-muted">📞 Suara Panggilan (Call)</span>
+                    <span className="font-mono tabular-nums text-emerald-300">{Math.round(callVolume * 100)}%</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={0}
+                    max={2}
+                    step={0.05}
+                    value={callVolume}
+                    onChange={(e) => onCallVolumeChange(Number(e.target.value))}
+                    className="h-1.5 w-full cursor-pointer accent-emerald-400"
+                  />
+                </div>
+
+                <div>
+                  <div className="mb-1 flex justify-between">
+                    <span className="text-muted">🎬 Suara Video Utama</span>
+                    <span className="font-mono tabular-nums text-pink-300">{Math.round(videoVolume * 100)}%</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={0}
+                    max={1}
+                    step={0.05}
+                    value={videoVolume}
+                    onChange={(e) => onVideoVolumeChange(Number(e.target.value))}
+                    className="h-1.5 w-full cursor-pointer accent-pink-500"
+                  />
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className="relative">
           <button
             className={btn}
-            onClick={() => setShowReactions((s) => !s)}
+            onClick={() => {
+              setShowReactions((s) => !s);
+              setShowMixer(false);
+            }}
             aria-expanded={showReactions}
             aria-label="Kirim reaksi"
           >

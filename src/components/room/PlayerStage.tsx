@@ -19,6 +19,7 @@ interface Props {
   sync: ReturnType<typeof usePlaybackSync>;
   screenShare: ActiveScreenShare | null;
   onStopScreenShare: () => void;
+  videoVolume: number;
   reactions: FloatingReaction[];
   peersBuffering: string[];
   fill: boolean;
@@ -28,9 +29,11 @@ const AUTO_SKIP_SECONDS = 8;
 
 function ScreenShareStage({
   screenShare,
+  videoVolume,
   onStop,
 }: {
   screenShare: ActiveScreenShare;
+  videoVolume: number;
   onStop: () => void;
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -41,6 +44,7 @@ function ScreenShareStage({
     if (!el) return;
     el.srcObject = screenShare.stream;
     el.muted = screenShare.isSelf;
+    el.volume = Math.min(1, Math.max(0, videoVolume));
     el.play().catch(() => {
       if (!screenShare.isSelf) {
         el.muted = true;
@@ -48,7 +52,14 @@ function ScreenShareStage({
         void el.play().catch(() => {});
       }
     });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [screenShare.stream, screenShare.streamVersion, screenShare.isSelf]);
+
+  useEffect(() => {
+    if (videoRef.current) {
+      videoRef.current.volume = Math.min(1, Math.max(0, videoVolume));
+    }
+  }, [videoVolume]);
 
   return (
     <div className="absolute inset-0 bg-black">
@@ -91,6 +102,7 @@ export default function PlayerStage({
   sync,
   screenShare,
   onStopScreenShare,
+  videoVolume,
   reactions,
   peersBuffering,
   fill,
@@ -102,6 +114,12 @@ export default function PlayerStage({
     setError(null);
     setCountdown(null);
   }, [item?.id]);
+
+  useEffect(() => {
+    if (screenShare) {
+      sync.player.detach();
+    }
+  }, [screenShare, sync.player]);
 
   useEffect(() => {
     if (countdown === null) return;
@@ -120,7 +138,7 @@ export default function PlayerStage({
     <div className={`stage relative mx-auto w-full overflow-hidden ${sizeCls}`}>
       {/* Jika sedang ada Share Screen aktif, tampilkan di panggung video utama */}
       {screenShare ? (
-        <ScreenShareStage screenShare={screenShare} onStop={onStopScreenShare} />
+        <ScreenShareStage screenShare={screenShare} videoVolume={videoVolume} onStop={onStopScreenShare} />
       ) : (
         <>
           {!item && (
