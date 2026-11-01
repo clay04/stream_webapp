@@ -300,6 +300,8 @@ export default function RoomView({ initial, userId, userName }: Props) {
               sync={sync}
               screenShare={rtc.activeScreenShare}
               onStopScreenShare={() => void rtc.toggleScreenShare()}
+              onCaptureSystemAudio={rtc.captureSystemAudioForScreen}
+              onAttachDeviceAudio={rtc.attachDeviceAudioToScreen}
               videoVolume={effectiveVideoVolume}
               reactions={reactions}
               peersBuffering={sync.peersBuffering}

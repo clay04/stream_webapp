@@ -19,6 +19,8 @@ interface Props {
   sync: ReturnType<typeof usePlaybackSync>;
   screenShare: ActiveScreenShare | null;
   onStopScreenShare: () => void;
+  onCaptureSystemAudio: () => Promise<boolean>;
+  onAttachDeviceAudio: (deviceId: string) => Promise<boolean>;
   videoVolume: number;
   reactions: FloatingReaction[];
   peersBuffering: string[];
@@ -31,13 +33,24 @@ function ScreenShareStage({
   screenShare,
   videoVolume,
   onStop,
+  onCaptureSystemAudio,
+  onAttachDeviceAudio,
 }: {
   screenShare: ActiveScreenShare;
   videoVolume: number;
   onStop: () => void;
+  onCaptureSystemAudio: () => Promise<boolean>;
+  onAttachDeviceAudio: (deviceId: string) => Promise<boolean>;
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [needsUnmute, setNeedsUnmute] = useState(false);
+  const [showAudioMenu, setShowAudioMenu] = useState(false);
+  const [audioDevices, setAudioDevices] = useState<MediaDeviceInfo[]>([]);
+  const [loadingDevices, setLoadingDevices] = useState(false);
+
+  const hasAudioTrack = screenShare.stream
+    .getAudioTracks()
+    .some((t) => t.readyState === "live");
 
   useEffect(() => {
     const el = videoRef.current;
@@ -61,21 +74,140 @@ function ScreenShareStage({
     }
   }, [videoVolume]);
 
+  const loadAudioDevices = async () => {
+    if (!navigator.mediaDevices?.enumerateDevices) return;
+    setLoadingDevices(true);
+    try {
+      let list = await navigator.mediaDevices.enumerateDevices();
+      const inputs = list.filter((d) => d.kind === "audioinput");
+      // Jika label masih kosong karena izin belum diberikan, minta izin singkat
+      if (inputs.length > 0 && inputs.every((d) => !d.label) && navigator.mediaDevices.getUserMedia) {
+        try {
+          const tmp = await navigator.mediaDevices.getUserMedia({ audio: true });
+          tmp.getTracks().forEach((t) => t.stop());
+          list = await navigator.mediaDevices.enumerateDevices();
+        } catch {
+          /* abaikan */
+        }
+      }
+      setAudioDevices(list.filter((d) => d.kind === "audioinput" && d.deviceId));
+    } finally {
+      setLoadingDevices(false);
+    }
+  };
+
   return (
     <div className="absolute inset-0 bg-black">
       <video ref={videoRef} autoPlay playsInline className="h-full w-full object-contain" />
-      <div className=" absolute left-3 top-3 z-10 flex items-center gap-2 rounded-full bg-black/75 px-3 py-1.5 text-xs text-white backdrop-blur-sm">
+      <div className="absolute left-3 top-3 z-20 flex flex-wrap items-center gap-2 rounded-2xl bg-black/80 px-3 py-1.5 text-xs text-white backdrop-blur-md">
         <span>🖥️ Layar {screenShare.name}</span>
+
+        <span
+          className={`rounded-full px-2 py-0.5 text-[11px] font-medium ${
+            hasAudioTrack
+              ? "bg-emerald-500/25 text-emerald-300 ring-1 ring-emerald-500/40"
+              : "bg-amber-500/25 text-amber-200 ring-1 ring-amber-500/40"
+          }`}
+        >
+          {hasAudioTrack ? "🔊 Audio Aktif" : "🔇 Tanpa Audio"}
+        </span>
+
         {screenShare.isSelf && (
-          <button
-            type="button"
-            onClick={onStop}
-            className="rounded-full bg-red-600 px-2.5 py-0.5 text-[11px] font-semibold text-white hover:bg-red-500"
-          >
-            Hentikan
-          </button>
+          <>
+            <button
+              type="button"
+              onClick={() => {
+                const next = !showAudioMenu;
+                setShowAudioMenu(next);
+                if (next) void loadAudioDevices();
+              }}
+              className="rounded-full bg-surface-2 px-2.5 py-0.5 text-[11px] font-medium text-white ring-1 ring-white/20 hover:bg-border"
+              title="Tambahkan atau ganti sumber suara sistem untuk Share Window / Layar"
+            >
+              {hasAudioTrack ? "⚙️ Sumber Audio" : "🔊 + Tambah Audio Sistem"}
+            </button>
+
+            <button
+              type="button"
+              onClick={onStop}
+              className="rounded-full bg-red-600 px-2.5 py-0.5 text-[11px] font-semibold text-white hover:bg-red-500"
+            >
+              Hentikan
+            </button>
+          </>
         )}
       </div>
+
+      {/* Menu penambah Audio Sistem saat pengguna melakukan Share Window / Entire Screen */}
+      {screenShare.isSelf && showAudioMenu && (
+        <div className="absolute left-3 top-14 z-30 w-80 max-w-[calc(100vw-24px)] rounded-2xl border border-white/15 bg-surface/95 p-3.5 text-xs text-white shadow-2xl backdrop-blur-md">
+          <div className="mb-2 flex items-center justify-between">
+            <span className="font-semibold">🔊 Audio Share Window / Layar</span>
+            <button
+              type="button"
+              onClick={() => setShowAudioMenu(false)}
+              className="rounded px-1.5 py-0.5 text-muted hover:bg-white/10 hover:text-white"
+            >
+              ✕
+            </button>
+          </div>
+
+          <p className="mb-2.5 text-[11px] leading-relaxed text-muted">
+            Jika browser tidak menyertakan suara saat memilih <strong>Window (Jendela)</strong>, kamu bisa menggabungkan suara sistem ke tayangan ini tanpa menghentikan video Window:
+          </p>
+
+          <button
+            type="button"
+            onClick={async () => {
+              const ok = await onCaptureSystemAudio();
+              if (ok) setShowAudioMenu(false);
+            }}
+            className="mb-3 w-full rounded-xl bg-accent-strong px-3 py-2 text-left text-xs font-semibold text-white hover:bg-accent"
+          >
+            🖥️ Ambil Audio dari &ldquo;Seluruh Layar&rdquo; / Tab
+            <span className="mt-0.5 block text-[10px] font-normal text-pink-100/90">
+              Pilih tab <b>Seluruh Layar (Entire Screen)</b> atau <b>Tab</b> lalu aktifkan centang <b>Bagikan audio sistem</b>.
+            </span>
+          </button>
+
+          <div className="border-t border-border pt-2.5">
+            <div className="mb-1.5 flex items-center justify-between">
+              <span className="text-[11px] font-medium text-muted">
+                Atau pilih perangkat audio (Monitor / Stereo Mix):
+              </span>
+              <button
+                type="button"
+                onClick={() => void loadAudioDevices()}
+                className="text-[11px] text-accent hover:underline"
+              >
+                {loadingDevices ? "Memuat…" : "Muat ulang"}
+              </button>
+            </div>
+
+            {audioDevices.length === 0 ? (
+              <p className="text-[11px] text-muted">Tidak ada perangkat input audio terdeteksi.</p>
+            ) : (
+              <div className="max-h-36 space-y-1 overflow-y-auto pr-1">
+                {audioDevices.map((d, idx) => (
+                  <button
+                    key={d.deviceId || idx}
+                    type="button"
+                    onClick={async () => {
+                      const ok = await onAttachDeviceAudio(d.deviceId);
+                      if (ok) setShowAudioMenu(false);
+                    }}
+                    className="w-full truncate rounded-lg bg-surface-2 px-2.5 py-1.5 text-left text-[11px] hover:bg-border"
+                    title={d.label || `Perangkat Audio ${idx + 1}`}
+                  >
+                    🎙️ {d.label || `Perangkat Audio ${idx + 1}`}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
       {needsUnmute && !screenShare.isSelf && (
         <div className="absolute inset-0 z-10 grid place-items-center bg-black/40">
           <button
@@ -102,6 +234,8 @@ export default function PlayerStage({
   sync,
   screenShare,
   onStopScreenShare,
+  onCaptureSystemAudio,
+  onAttachDeviceAudio,
   videoVolume,
   reactions,
   peersBuffering,
@@ -138,7 +272,13 @@ export default function PlayerStage({
     <div className={`stage relative mx-auto w-full overflow-hidden ${sizeCls}`}>
       {/* Jika sedang ada Share Screen aktif, tampilkan di panggung video utama */}
       {screenShare ? (
-        <ScreenShareStage screenShare={screenShare} videoVolume={videoVolume} onStop={onStopScreenShare} />
+        <ScreenShareStage
+          screenShare={screenShare}
+          videoVolume={videoVolume}
+          onStop={onStopScreenShare}
+          onCaptureSystemAudio={onCaptureSystemAudio}
+          onAttachDeviceAudio={onAttachDeviceAudio}
+        />
       ) : (
         <>
           {!item && (

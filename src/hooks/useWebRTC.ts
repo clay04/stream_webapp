@@ -857,9 +857,20 @@ export function useWebRTC({ selfClientId, selfName, channel, online, onVolumeDuc
       let displayStream: MediaStream;
       try {
         displayStream = await navigator.mediaDevices.getDisplayMedia({
-          video: true,
-          audio: true,
-        });
+          video: {
+            frameRate: { ideal: 30, max: 60 },
+          },
+          audio: {
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false,
+            suppressLocalAudioPlayback: false,
+          } as MediaTrackConstraints,
+          systemAudio: "include",
+          windowAudio: "system",
+          surfaceSwitching: "include",
+          selfBrowserSurface: "include",
+        } as DisplayMediaStreamOptions);
       } catch (firstErr) {
         const errName = (firstErr as DOMException)?.name;
         if (errName === "NotAllowedError" || errName === "AbortError") {
@@ -867,11 +878,44 @@ export function useWebRTC({ selfClientId, selfName, channel, online, onVolumeDuc
         }
         displayStream = await navigator.mediaDevices.getDisplayMedia({
           video: true,
+          audio: true,
         });
       }
 
       const screenTrack = displayStream.getVideoTracks()[0];
       if (!screenTrack) return;
+
+      // Jika pengguna memilih Window / Entire Screen dan browser belum menyertakan track audio,
+      // coba cari otomatis perangkat loopback/monitor sistem (mis. PulseAudio/PipeWire Monitor di Linux atau Stereo Mix di Windows).
+      if (displayStream.getAudioTracks().length === 0 && navigator.mediaDevices?.enumerateDevices) {
+        try {
+          const devices = await navigator.mediaDevices.enumerateDevices();
+          const sysMonitor = devices.find(
+            (d) =>
+              d.kind === "audioinput" &&
+              d.deviceId &&
+              /monitor of|stereo mix|what u hear|system audio|loopback|blackhole|soundflower|cable output/i.test(
+                d.label,
+              ),
+          );
+          if (sysMonitor) {
+            const sysAudio = await navigator.mediaDevices.getUserMedia({
+              audio: {
+                deviceId: { exact: sysMonitor.deviceId },
+                echoCancellation: false,
+                noiseSuppression: false,
+                autoGainControl: false,
+              },
+            });
+            const sysTrack = sysAudio.getAudioTracks()[0];
+            if (sysTrack) {
+              displayStream.addTrack(sysTrack);
+            }
+          }
+        } catch {
+          /* abaikan bila tidak ada perangkat monitor otomatis */
+        }
+      }
 
       screenTrack.onended = () => {
         stopScreenShare();
@@ -922,6 +966,112 @@ export function useWebRTC({ selfClientId, selfName, channel, online, onVolumeDuc
       setError((err as Error).message || "Gagal membagikan layar.");
     }
   }, [broadcastState, cleanDeadPeers, getOrCreatePeer, selfClientId, sendOffer, stopScreenShare, syncLocalTracksToPeer]);
+
+  /**
+   * Sisipkan track audio tambahan (dari Audio Sistem / Seluruh Layar / Perangkat Monitor)
+   * ke dalam stream Share Screen yang sedang berjalan (mis. saat sedang share Window).
+   */
+  const attachAudioTrackToScreenShare = useCallback(
+    (audioTrack: MediaStreamTrack) => {
+      const screenStream = localScreenStreamRef.current;
+      if (!screenStream || !screenSharingRef.current) {
+        audioTrack.stop();
+        return;
+      }
+
+      // Hentikan track audio layar lama bila ada
+      for (const oldAudio of screenStream.getAudioTracks()) {
+        oldAudio.stop();
+        screenStream.removeTrack(oldAudio);
+        for (const p of peersRef.current.values()) {
+          const sender = p.pc.getSenders().find((s) => s.track === oldAudio);
+          if (sender) {
+            try {
+              p.pc.removeTrack(sender);
+            } catch {
+              /* abaikan */
+            }
+          }
+        }
+      }
+
+      screenStream.addTrack(audioTrack);
+      setLocalVersion((v) => v + 1);
+
+      broadcastState("media-state");
+      for (const [peerId, p] of peersRef.current.entries()) {
+        syncLocalTracksToPeer(p);
+        void sendOffer(peerId, p);
+      }
+    },
+    [broadcastState, sendOffer, syncLocalTracksToPeer],
+  );
+
+  /**
+   * Ambil audio sistem dari "Seluruh Layar (Entire Screen)" atau "Tab" lalu gabungkan
+   * ke video Share Window yang sedang aktif tanpa menghentikan video Window tersebut.
+   */
+  const captureSystemAudioForScreen = useCallback(async (): Promise<boolean> => {
+    if (!localScreenStreamRef.current || !screenSharingRef.current) return false;
+    try {
+      const audioCaptureStream = await navigator.mediaDevices.getDisplayMedia({
+        video: true,
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+          suppressLocalAudioPlayback: false,
+        } as MediaTrackConstraints,
+        systemAudio: "include",
+        windowAudio: "system",
+      } as DisplayMediaStreamOptions);
+      // Hentikan track video sementara karena kita hanya butuh track audio sistemnya
+      for (const vt of audioCaptureStream.getVideoTracks()) {
+        vt.stop();
+      }
+      const audioTrack = audioCaptureStream.getAudioTracks()[0];
+      if (!audioTrack) {
+        setError("Tidak ada audio yang dipilih. Pastikan mencentang 'Bagikan audio sistem / tab' saat memilih.");
+        return false;
+      }
+      attachAudioTrackToScreenShare(audioTrack);
+      return true;
+    } catch (err) {
+      const errName = (err as DOMException)?.name;
+      if (errName !== "NotAllowedError" && errName !== "AbortError") {
+        setError((err as Error).message || "Gagal mengambil audio sistem.");
+      }
+      return false;
+    }
+  }, [attachAudioTrackToScreenShare]);
+
+  /**
+   * Ambil audio dari perangkat input/monitor sistem tertentu (mis. Monitor of Built-in Audio di Linux
+   * atau Stereo Mix / Cable Output di Windows) untuk digabungkan ke Share Screen.
+   */
+  const attachDeviceAudioToScreen = useCallback(
+    async (deviceId: string): Promise<boolean> => {
+      if (!localScreenStreamRef.current || !screenSharingRef.current) return false;
+      try {
+        const audioStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            deviceId: deviceId ? { exact: deviceId } : undefined,
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false,
+          },
+        });
+        const audioTrack = audioStream.getAudioTracks()[0];
+        if (!audioTrack) return false;
+        attachAudioTrackToScreenShare(audioTrack);
+        return true;
+      } catch (err) {
+        setError((err as Error).message || "Gagal mengakses perangkat audio tersebut.");
+        return false;
+      }
+    },
+    [attachAudioTrackToScreenShare],
+  );
 
   // ---------- Otomatis gabung kembali ke Call jika halaman di-refresh tanpa menutup Call ----------
   useEffect(() => {
@@ -1228,6 +1378,8 @@ export function useWebRTC({ selfClientId, selfName, channel, online, onVolumeDuc
     toggleMic,
     toggleCam,
     toggleScreenShare,
+    captureSystemAudioForScreen,
+    attachDeviceAudioToScreen,
   };
 }
 
